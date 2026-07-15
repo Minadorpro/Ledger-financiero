@@ -196,6 +196,14 @@ function makeDataStore(uid) {
     },
     async save(data) {
       await ref.set(data);
+    },
+    // escucha cambios en tiempo real (incluidos los hechos desde otro dispositivo o pestaña).
+    // el callback recibe (data, hasPendingWrites) — hasPendingWrites=true significa que es un
+    // guardado propio de ESTE dispositivo, todavía no confirmado por el servidor.
+    listen(callback) {
+      return ref.onSnapshot((snap) => {
+        callback(snap.exists ? snap.data() : null, snap.metadata.hasPendingWrites);
+      }, (err) => console.error('Error escuchando cambios en Firestore', err));
     }
   };
 }
@@ -1476,36 +1484,44 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const store = useMemo(() => makeDataStore(userId), [userId]);
 
   // cargar datos al montar (o si cambia el usuario)
+  // se actualiza cada vez que ESTE dispositivo guarda algo, para reconocer cuando un
+  // cambio que llega por la escucha en vivo es solo la confirmación de nuestro propio
+  // guardado (y no aplicarlo de nuevo en bucle) vs. un cambio real hecho desde otro dispositivo
+  const lastWrittenRef = useRef(null);
+
   useEffect(() => {
     setLoaded(false);
-    (async () => {
-      const saved = await store.load();
-      const data = saved || seedData();
-      setDebts(data.debts || []);
-      setSubscriptions(data.subscriptions || []);
-      setFixedExpenses(data.fixedExpenses || []);
-      setSavingsProjects(data.savingsProjects || []);
-      setSavingsEntries(data.savingsEntries || []);
-      setIncomeEntries(data.incomeEntries || []);
-      setAntExpenses(data.antExpenses || []);
-      setAntBudget(data.antBudget || 0);
-      setIncomeSplitRules(data.incomeSplitRules || []);
-      setFinancialGoals(data.financialGoals || []);
-      setExtraIncome(data.extraIncome || []);
-      setSalaryOverrides(data.salaryOverrides || {});
-      setExchangeRate(data.exchangeRate || 0.92);
-      setExpectedIncome(data.expectedIncome || 0);
+    const unsubscribe = store.listen((data, hasPendingWrites) => {
+      if (hasPendingWrites) return; // es nuestro propio guardado aún sin confirmar — el estado local ya lo tiene
+      const json = JSON.stringify(data);
+      if (json === lastWrittenRef.current) return; // solo confirma lo que ya habíamos escrito nosotros
+      const d = data || seedData();
+      setDebts(d.debts || []);
+      setSubscriptions(d.subscriptions || []);
+      setFixedExpenses(d.fixedExpenses || []);
+      setSavingsProjects(d.savingsProjects || []);
+      setSavingsEntries(d.savingsEntries || []);
+      setIncomeEntries(d.incomeEntries || []);
+      setAntExpenses(d.antExpenses || []);
+      setAntBudget(d.antBudget || 0);
+      setIncomeSplitRules(d.incomeSplitRules || []);
+      setFinancialGoals(d.financialGoals || []);
+      setExtraIncome(d.extraIncome || []);
+      setSalaryOverrides(d.salaryOverrides || {});
+      setExchangeRate(d.exchangeRate || 0.92);
+      setExpectedIncome(d.expectedIncome || 0);
       // migración puntual SOLO para el dueño de la app: sus cuentas ya existían antes de esta sección.
       // cualquier otro usuario empieza con la lista vacía y crea las suyas.
-      const needsAccounts = isOwner && !data.accountsInit && (!data.accounts || data.accounts.length === 0);
-      setAccounts(needsAccounts ? DEFAULT_ACCOUNTS() : (data.accounts || []));
+      const needsAccounts = isOwner && !d.accountsInit && (!d.accounts || d.accounts.length === 0);
+      setAccounts(needsAccounts ? DEFAULT_ACCOUNTS() : (d.accounts || []));
       setAccountsInit(true);
-      setTransfers(data.transfers || []);
-      setAppliedPayments(data.appliedPayments || null);
-      setMonthlyHistory(data.monthlyHistory || []);
-      setTheme(data.theme || 'dark');
+      setTransfers(d.transfers || []);
+      setAppliedPayments(d.appliedPayments || null);
+      setMonthlyHistory(d.monthlyHistory || []);
+      setTheme(d.theme || 'dark');
       setLoaded(true);
-    })();
+    });
+    return () => unsubscribe && unsubscribe();
   }, [store]);
 
   // guardar cuando cambie algo — con un pequeño margen (debounce): una edición dispara varios
@@ -1519,7 +1535,9 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   useEffect(() => {
     if (!loaded) return;
     const t = setTimeout(() => {
-      store.save({ debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, appliedPayments, monthlyHistory, theme, exchangeRate })
+      const payload = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, appliedPayments, monthlyHistory, theme, exchangeRate };
+      lastWrittenRef.current = JSON.stringify(payload);
+      store.save(payload)
         .then(() => setSaveError(null))
         .catch(e => { console.error('No se pudo guardar en Firestore', e); setSaveError(e && e.message ? e.message : String(e)); });
     }, 150);
@@ -1530,7 +1548,11 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   // el margen de arriba llegue a disparar el guardado, forzamos un guardado inmediato con lo
   // último que haya en memoria. Así una recarga rápida justo después de editar no pierde el cambio.
   useEffect(() => {
-    const flush = () => { if (latestSnapshotRef.current) store.save(latestSnapshotRef.current).catch(e=>console.error('No se pudo guardar (flush)', e)); };
+    const flush = () => {
+      if (!latestSnapshotRef.current) return;
+      lastWrittenRef.current = JSON.stringify(latestSnapshotRef.current);
+      store.save(latestSnapshotRef.current).catch(e=>console.error('No se pudo guardar (flush)', e));
+    };
     window.addEventListener('beforeunload', flush);
     window.addEventListener('pagehide', flush);
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flush(); });
