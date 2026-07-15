@@ -11,8 +11,16 @@
 <meta name="apple-mobile-web-app-title" content="Ledger">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0F1115">
-<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' rx='40' fill='%230F1115'/%3E%3Ctext x='90' y='122' font-family='monospace' font-size='104' font-weight='bold' fill='%23C9A227' text-anchor='middle'%3EL%3C/text%3E%3C/svg%3E">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' rx='40' fill='%230F1115'/%3E%3Ctext x='90' y='122' font-family='monospace' font-size='104' font-weight='bold' fill='%23C9A227' text-anchor='middle'%3EL%3C/text%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="icon" href="icon-192.png">
+<link rel="manifest" href="manifest.json">
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').catch(()=>{});
+    });
+  }
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -536,6 +544,7 @@ const IWand = (p) => <Icon {...p}><path d="m4 20 10-10"/><path d="M14.5 9.5 20 4
 const IEye = (p) => <Icon {...p}><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></Icon>;
 const IEyeOff = (p) => <Icon {...p}><path d="M3 3l18 18"/><path d="M10.6 5.2A10.4 10.4 0 0 1 12 5c6.5 0 10 7 10 7a17.3 17.3 0 0 1-3.4 4.3M6.6 6.6C3.7 8.4 2 12 2 12s3.5 7 10 7a10 10 0 0 0 3.4-.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></Icon>;
 const IUser = (p) => <Icon {...p}><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.5-6.5 8-6.5s8 2.5 8 6.5"/></Icon>;
+const IMore = (p) => <Icon {...p}><circle cx="5" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.6" fill="currentColor" stroke="none"/></Icon>;
 
 /* =========================================================================
    PIEZAS DE UI PEQUEÑAS
@@ -1455,6 +1464,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const [monthlyHistory, setMonthlyHistory] = useState([]);
   const [view, setView] = useState('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
   const [modal, setModal] = useState(null); // {type:'debt'|'sub'|'fixed'|'project'|'saving', item?}
   const [openAccountId, setOpenAccountId] = useState(null); // cuenta abierta como página completa (vista 'accountDetail')
   const [confirmDel, setConfirmDel] = useState(null); // {type, id, name}
@@ -2315,18 +2325,40 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         </div>
 
         {/* NAV MÓVIL */}
-        <nav className="no-print md:hidden fixed bottom-0 inset-x-0 z-30 bg-white/95 dark:bg-ink-800/95 backdrop-blur border-paper-300 dark:border-ink-500/60 flex justify-around py-2 overflow-x-auto">
+        <nav className="no-print md:hidden fixed bottom-0 inset-x-0 z-30 bg-white/95 dark:bg-ink-800/95 backdrop-blur border-paper-300 dark:border-ink-500/60 flex justify-around py-2">
           <MobileNavItem icon={<IHome size={20}/>} active={view==='dashboard'} onClick={()=>setView('dashboard')}/>
           <MobileNavItem icon={<IBank size={20}/>} active={view==='accounts'||view==='accountDetail'} onClick={()=>setView('accounts')}/>
           <MobileNavItem icon={<ICard size={20}/>} active={view==='debts'} onClick={()=>setView('debts')}/>
-          <MobileNavItem icon={<IRepeat size={20}/>} active={view==='subs'} onClick={()=>setView('subs')}/>
-          <MobileNavItem icon={<IReceipt size={20}/>} active={view==='fixed'} onClick={()=>setView('fixed')}/>
-          <MobileNavItem icon={<IPiggy size={20}/>} active={view==='savings'} onClick={()=>setView('savings')}/>
-          <MobileNavItem icon={<IArrowDown size={20}/>} active={view==='income'} onClick={()=>setView('income')}/>
-          <MobileNavItem icon={<IDrop size={20}/>} active={view==='ants'} onClick={()=>setView('ants')}/>
           <MobileNavItem icon={<ICalendar size={20}/>} active={view==='calendar'} onClick={()=>setView('calendar')}/>
-          <MobileNavItem icon={<IChart size={20}/>} active={view==='stats'} onClick={()=>setView('stats')}/>
+          <MobileNavItem icon={<IMore size={20}/>} active={mobileMoreOpen} onClick={()=>setMobileMoreOpen(true)}/>
         </nav>
+
+        {mobileMoreOpen && (
+          <Modal title="Más secciones" onClose={()=>setMobileMoreOpen(false)}>
+            <div className="grid grid-cols-3 gap-2">
+              {[
+                {icon:<IRepeat size={20}/>, label:'Suscripciones', view:'subs'},
+                {icon:<IReceipt size={20}/>, label:'Gastos fijos', view:'fixed'},
+                {icon:<IPiggy size={20}/>, label:'Ahorro', view:'savings'},
+                {icon:<IFlag size={20}/>, label:'Metas', view:'goals'},
+                {icon:<IArrowDown size={20}/>, label:'Entradas', view:'income'},
+                {icon:<IDrop size={20}/>, label:'Gastos hormiga', view:'ants'},
+                {icon:<IPercent size={20}/>, label:'Reparto', view:'split'},
+                {icon:<IWand size={20}/>, label:'Simulador', view:'simulator'},
+                {icon:<IRepeat size={20}/>, label:'Transferencias', view:'transfers'},
+                {icon:<IChart size={20}/>, label:'Estadísticas', view:'stats'},
+                {icon:<IArchive size={20}/>, label:'Historial', view:'history'},
+                {icon:<IUser size={20}/>, label:'Usuario', view:'account'},
+              ].map(item => (
+                <button key={item.view} onClick={()=>{setView(item.view); setMobileMoreOpen(false);}}
+                  className={`flex flex-col items-center gap-1.5 p-3 rounded-xl transition ${view===item.view ? 'bg-gold-500/15 text-gold-500' : 'text-gray-600 dark:text-gray-400 hover:bg-paper-200 dark:hover:bg-ink-600'}`}>
+                  {item.icon}
+                  <span className="text-xs text-center leading-tight">{item.label}</span>
+                </button>
+              ))}
+            </div>
+          </Modal>
+        )}
 
         {/* MODALES */}
         {modal?.type==='debt' && <Modal title={modal.item? 'Editar deuda':'Nueva deuda'} onClose={()=>setModal(null)}><DebtForm initial={modal.item} accounts={accounts} onSave={upsertDebt} onClose={()=>setModal(null)}/></Modal>}
@@ -4533,3 +4565,60 @@ ReactDOM.createRoot(document.getElementById('root')).render(<Root/>);
 </script>
 </body>
 </html>
+
+{
+  "name": "Ledger — Compromisos financieros",
+  "short_name": "Ledger",
+  "description": "Gestión de finanzas personales: deudas, suscripciones, gastos fijos, ahorro y más.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0B0E14",
+  "theme_color": "#0F1115",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
+
+// Service worker mínimo: hace que la app sea instalable y guarda una copia
+// del archivo principal para que abra aunque no haya conexión en ese momento.
+// Los datos reales (Firestore) siguen necesitando internet para sincronizarse.
+const CACHE_NAME = 'ledger-cache-v1';
+const APP_SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)).catch(()=>{})
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', (event) => {
+  if (event.request.method !== 'GET') return;
+  event.respondWith(
+    caches.match(event.request).then((cached) => {
+      const network = fetch(event.request)
+        .then((response) => {
+          if (response && response.ok) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+          }
+          return response;
+        })
+        .catch(() => cached);
+      return cached || network;
+    })
+  );
+});
