@@ -533,6 +533,9 @@ const IHand = (p) => <Icon {...p}><path d="M8 12.5V5a1.5 1.5 0 0 1 3 0v6M11 11V3
 const IPercent = (p) => <Icon {...p}><path d="m19 5-14 14"/><circle cx="7" cy="7" r="2.5"/><circle cx="17" cy="17" r="2.5"/></Icon>;
 const IFlag = (p) => <Icon {...p}><path d="M5 21V4"/><path d="M5 4.5c1.5-1 3.5-1 5 0s3.5 1 5 0v8c-1.5 1-3.5 1-5 0s-3.5-1-5 0Z"/></Icon>;
 const IWand = (p) => <Icon {...p}><path d="m4 20 10-10"/><path d="M14.5 9.5 20 4"/><path d="M15 3v3M20.5 8.5h-3M9 3l.8 2.2L12 6l-2.2.8L9 9l-.8-2.2L6 6l2.2-.8Z"/></Icon>;
+const IEye = (p) => <Icon {...p}><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></Icon>;
+const IEyeOff = (p) => <Icon {...p}><path d="M3 3l18 18"/><path d="M10.6 5.2A10.4 10.4 0 0 1 12 5c6.5 0 10 7 10 7a17.3 17.3 0 0 1-3.4 4.3M6.6 6.6C3.7 8.4 2 12 2 12s3.5 7 10 7a10 10 0 0 0 3.4-.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></Icon>;
+const IUser = (p) => <Icon {...p}><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.5-6.5 8-6.5s8 2.5 8 6.5"/></Icon>;
 
 /* =========================================================================
    PIEZAS DE UI PEQUEÑAS
@@ -719,6 +722,20 @@ function Field({ label, children }) {
   );
 }
 const inputCls = "w-full bg-paper-200 dark:bg-ink-800 border border-paper-300 dark:border-ink-500 rounded-lg px-3 py-2 text-ink-900 dark:text-gray-100 text-sm focus:outline-none focus:border-gold-500 transition";
+
+function PasswordInput({ value, onChange, placeholder, required, minLength, autoFocus, autoComplete }) {
+  const [show, setShow] = useState(false);
+  return (
+    <div className="relative">
+      <input type={show ? 'text' : 'password'} required={required} minLength={minLength} autoFocus={autoFocus} autoComplete={autoComplete}
+        value={value} onChange={e=>onChange(e.target.value)} className={inputCls+" pr-10"} placeholder={placeholder}/>
+      <button type="button" onClick={()=>setShow(s=>!s)} tabIndex={-1}
+        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-500 hover:text-ink-900 dark:hover:text-gray-200 transition">
+        {show ? <IEyeOff size={16}/> : <IEye size={16}/>}
+      </button>
+    </div>
+  );
+}
 
 function ConfirmDialog({ text, onConfirm, onCancel }) {
   return (
@@ -1412,7 +1429,7 @@ function ExtraIncomeForm({ initial, onSave, onClose }) {
 /* =========================================================================
    APP
    ========================================================================= */
-function App({ userId, isAdmin, onLogout }) {
+function App({ userId, userEmail, isAdmin, onLogout }) {
   const isOwner = isAdmin; // solo el dueño recibe la migración de cuentas iniciales
   const [loaded, setLoaded] = useState(false);
   const [theme, setTheme] = useState('dark');
@@ -2107,6 +2124,7 @@ function App({ userId, isAdmin, onLogout }) {
               <NavItem icon={<ICalendar size={18}/>} label="Calendario" active={view==='calendar'} onClick={()=>setView('calendar')} collapsed={!sidebarOpen}/>
               <NavItem icon={<IChart size={18}/>} label="Estadísticas" active={view==='stats'} onClick={()=>setView('stats')} collapsed={!sidebarOpen}/>
               <NavItem icon={<IArchive size={18}/>} label="Historial" active={view==='history'} onClick={()=>setView('history')} count={finishedDebts.length} collapsed={!sidebarOpen}/>
+              <NavItem icon={<IUser size={18}/>} label="Usuario" active={view==='account'} onClick={()=>setView('account')} collapsed={!sidebarOpen}/>
             </nav>
             <div className={`mt-auto flex flex-col gap-3 ${sidebarOpen ? 'px-2' : 'items-center px-0'}`}>
               {sidebarOpen ? (
@@ -2291,6 +2309,7 @@ function App({ userId, isAdmin, onLogout }) {
                   totalDebtMonthly={totalDebtMonthly} totalSubMonthly={subsMonthlyReal} totalFixedMonthly={totalFixedMonthly} history={monthlyHistory}/>
               )}
               {view==='history' && <HistoryView items={finishedDebts}/>}
+              {view==='account' && <AccountSettingsView userEmail={userEmail} onLogout={onLogout}/>}
             </main>
           </div>
         </div>
@@ -2342,7 +2361,7 @@ function App({ userId, isAdmin, onLogout }) {
 }
 
 function viewTitle(v) {
-  return { dashboard:'Dashboard', accounts:'Cuentas', debts:'Deudas', subs:'Suscripciones', fixed:'Gastos fijos', savings:'Ahorro', goals:'Metas', income:'Entradas', ants:'Gastos hormiga', split:'Reparto de ingresos', simulator:'Simulador', transfers:'Transferencias', calendar:'Calendario', stats:'Estadísticas', history:'Historial' }[v] || '';
+  return { dashboard:'Dashboard', accounts:'Cuentas', debts:'Deudas', subs:'Suscripciones', fixed:'Gastos fijos', savings:'Ahorro', goals:'Metas', income:'Entradas', ants:'Gastos hormiga', split:'Reparto de ingresos', simulator:'Simulador', transfers:'Transferencias', calendar:'Calendario', stats:'Estadísticas', history:'Historial', account:'Usuario' }[v] || '';
 }
 
 function NavItem({ icon, label, active, onClick, count, collapsed }) {
@@ -4288,6 +4307,121 @@ function HistoryView({ items }) {
 }
 
 /* =========================================================================
+   USUARIO (correo, contraseña, sesión)
+   ========================================================================= */
+function AccountSettingsView({ userEmail, onLogout }) {
+  const [newEmail, setNewEmail] = useState('');
+  const [emailPassword, setEmailPassword] = useState('');
+  const [emailBusy, setEmailBusy] = useState(false);
+  const [emailMsg, setEmailMsg] = useState('');
+  const [emailErr, setEmailErr] = useState('');
+
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [newPassword2, setNewPassword2] = useState('');
+  const [passBusy, setPassBusy] = useState(false);
+  const [passMsg, setPassMsg] = useState('');
+  const [passErr, setPassErr] = useState('');
+
+  const errorMessages = {
+    'auth/wrong-password': 'La contraseña actual no es correcta.',
+    'auth/invalid-credential': 'La contraseña actual no es correcta.',
+    'auth/weak-password': 'La contraseña nueva debe tener al menos 6 caracteres.',
+    'auth/email-already-in-use': 'Ya existe una cuenta con ese correo.',
+    'auth/invalid-email': 'Correo no válido.',
+    'auth/requires-recent-login': 'Por seguridad escribe de nuevo tu contraseña actual e inténtalo otra vez.',
+    'auth/too-many-requests': 'Demasiados intentos. Espera un momento e inténtalo de nuevo.',
+  };
+
+  const changeEmail = async (e) => {
+    e.preventDefault();
+    setEmailErr(''); setEmailMsg('');
+    if (!newEmail || !emailPassword) return;
+    setEmailBusy(true);
+    try {
+      const cred = firebase.auth.EmailAuthProvider.credential(userEmail, emailPassword);
+      await auth.currentUser.reauthenticateWithCredential(cred);
+      await auth.currentUser.updateEmail(newEmail);
+      setEmailMsg(`Listo. Tu correo ahora es ${newEmail}. La próxima vez, inicia sesión con ese correo.`);
+      setNewEmail(''); setEmailPassword('');
+    } catch (err) {
+      setEmailErr(errorMessages[err.code] || 'No se pudo cambiar el correo. Intenta de nuevo.');
+    } finally { setEmailBusy(false); }
+  };
+
+  const changePassword = async (e) => {
+    e.preventDefault();
+    setPassErr(''); setPassMsg('');
+    if (!currentPassword || !newPassword) return;
+    if (newPassword !== newPassword2) { setPassErr('Las dos contraseñas nuevas no coinciden.'); return; }
+    setPassBusy(true);
+    try {
+      const cred = firebase.auth.EmailAuthProvider.credential(userEmail, currentPassword);
+      await auth.currentUser.reauthenticateWithCredential(cred);
+      await auth.currentUser.updatePassword(newPassword);
+      setPassMsg('Listo. Tu contraseña se actualizó correctamente.');
+      setCurrentPassword(''); setNewPassword(''); setNewPassword2('');
+    } catch (err) {
+      setPassErr(errorMessages[err.code] || 'No se pudo cambiar la contraseña. Intenta de nuevo.');
+    } finally { setPassBusy(false); }
+  };
+
+  return (
+    <div className="flex flex-col gap-5 max-w-xl">
+      <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex flex-col gap-1">
+        <span className="uppercase tracking-wider text-gray-500 dark:text-gray-400 font-medium text-xs">Correo actual</span>
+        <span className="font-mono text-ink-900 dark:text-gray-100">{userEmail}</span>
+      </div>
+
+      <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex flex-col gap-4">
+        <h3 className="font-medium text-ink-900 dark:text-gray-100">Cambiar correo</h3>
+        <form onSubmit={changeEmail} className="flex flex-col gap-4">
+          <Field label="Correo nuevo">
+            <input type="email" required value={newEmail} onChange={e=>setNewEmail(e.target.value)} className={inputCls} placeholder="tunuevocorreo@ejemplo.com"/>
+          </Field>
+          <Field label="Confirma tu contraseña actual">
+            <PasswordInput required value={emailPassword} onChange={setEmailPassword} placeholder="Tu contraseña actual" autoComplete="current-password"/>
+          </Field>
+          {emailErr && <div className="text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">{emailErr}</div>}
+          {emailMsg && <div className="text-xs text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 rounded-lg px-3 py-2">{emailMsg}</div>}
+          <button type="submit" disabled={emailBusy} className="self-start px-4 py-2 rounded-lg bg-gold-500 hover:bg-gold-600 disabled:opacity-60 text-ink-900 font-medium text-sm transition">
+            {emailBusy ? 'Un momento…' : 'Guardar correo nuevo'}
+          </button>
+        </form>
+      </div>
+
+      <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex flex-col gap-4">
+        <h3 className="font-medium text-ink-900 dark:text-gray-100">Cambiar contraseña</h3>
+        <form onSubmit={changePassword} className="flex flex-col gap-4">
+          <Field label="Contraseña actual">
+            <PasswordInput required value={currentPassword} onChange={setCurrentPassword} autoComplete="current-password"/>
+          </Field>
+          <Field label="Contraseña nueva">
+            <PasswordInput required minLength={6} value={newPassword} onChange={setNewPassword} placeholder="Mínimo 6 caracteres" autoComplete="new-password"/>
+          </Field>
+          <Field label="Confirma la contraseña nueva">
+            <PasswordInput required minLength={6} value={newPassword2} onChange={setNewPassword2} autoComplete="new-password"/>
+          </Field>
+          {passErr && <div className="text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">{passErr}</div>}
+          {passMsg && <div className="text-xs text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 rounded-lg px-3 py-2">{passMsg}</div>}
+          <button type="submit" disabled={passBusy} className="self-start px-4 py-2 rounded-lg bg-gold-500 hover:bg-gold-600 disabled:opacity-60 text-ink-900 font-medium text-sm transition">
+            {passBusy ? 'Un momento…' : 'Guardar contraseña nueva'}
+          </button>
+        </form>
+      </div>
+
+      <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h3 className="font-medium text-ink-900 dark:text-gray-100">Cerrar sesión</h3>
+          <p className="text-xs text-gray-500 mt-0.5">Sales de tu cuenta en este dispositivo.</p>
+        </div>
+        <button onClick={onLogout} className="px-4 py-2 rounded-lg text-red-400 border border-red-500/30 hover:bg-red-500/10 text-sm font-medium transition">Cerrar sesión</button>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
    AUTENTICACIÓN
    ========================================================================= */
 function AuthScreen() {
@@ -4296,10 +4430,12 @@ function AuthScreen() {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [resetMsg, setResetMsg] = useState('');
+  const [resetBusy, setResetBusy] = useState(false);
 
   const submit = async (e) => {
     e.preventDefault();
-    setError(''); setBusy(true);
+    setError(''); setResetMsg(''); setBusy(true);
     try {
       if (mode === 'login') await auth.signInWithEmailAndPassword(email, password);
       else await auth.createUserWithEmailAndPassword(email, password);
@@ -4316,6 +4452,22 @@ function AuthScreen() {
     } finally { setBusy(false); }
   };
 
+  const sendReset = async () => {
+    setError(''); setResetMsg('');
+    if (!email) { setError('Escribe tu correo arriba primero, y luego dale a "¿Olvidaste tu contraseña?".'); return; }
+    setResetBusy(true);
+    try {
+      await auth.sendPasswordResetEmail(email);
+      setResetMsg(`Te enviamos un correo a ${email} con un enlace para poner una contraseña nueva. Revisa también spam/promociones.`);
+    } catch (err) {
+      const messages = {
+        'auth/invalid-email': 'Correo no válido.',
+        'auth/user-not-found': 'No existe una cuenta con ese correo — revisa que esté bien escrito.',
+      };
+      setError(messages[err.code] || 'No se pudo enviar el correo. Intenta de nuevo.');
+    } finally { setResetBusy(false); }
+  };
+
   return (
     <div className="min-h-screen bg-paper-100 dark:bg-ink-900 flex items-center justify-center p-4">
       <div className="w-full max-w-sm bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl shadow-soft p-7 animate-fadein">
@@ -4326,17 +4478,23 @@ function AuthScreen() {
         <h2 className="text-center text-sm text-gray-500 mb-6">{mode==='login' ? 'Inicia sesión para ver tus compromisos' : 'Crea tu cuenta para empezar'}</h2>
         <form onSubmit={submit} className="flex flex-col gap-4">
           <Field label="Correo electrónico">
-            <input type="email" required value={email} onChange={e=>setEmail(e.target.value)} className={inputCls} placeholder="tucorreo@ejemplo.com"/>
+            <input type="email" required value={email} onChange={e=>{setEmail(e.target.value); setResetMsg('');}} className={inputCls} placeholder="tucorreo@ejemplo.com"/>
           </Field>
           <Field label="Contraseña">
-            <input type="password" required minLength={6} value={password} onChange={e=>setPassword(e.target.value)} className={inputCls} placeholder="Mínimo 6 caracteres"/>
+            <PasswordInput required minLength={6} value={password} onChange={setPassword} placeholder="Mínimo 6 caracteres" autoComplete={mode==='login' ? 'current-password' : 'new-password'}/>
           </Field>
           {error && <div className="text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">{error}</div>}
+          {resetMsg && <div className="text-xs text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 rounded-lg px-3 py-2">{resetMsg}</div>}
           <button type="submit" disabled={busy} className="bg-gold-500 hover:bg-gold-600 disabled:opacity-60 text-ink-900 font-medium text-sm py-2.5 rounded-lg transition">
             {busy ? 'Un momento…' : mode==='login' ? 'Iniciar sesión' : 'Crear cuenta'}
           </button>
         </form>
-        <button onClick={()=>{setMode(m=>m==='login'?'signup':'login'); setError('');}} className="w-full text-center text-xs text-gray-500 hover:text-gold-500 transition mt-5">
+        {mode==='login' && (
+          <button onClick={sendReset} disabled={resetBusy} className="w-full text-center text-xs text-gray-500 hover:text-gold-500 transition mt-4 disabled:opacity-60">
+            {resetBusy ? 'Enviando…' : '¿Olvidaste tu contraseña?'}
+          </button>
+        )}
+        <button onClick={()=>{setMode(m=>m==='login'?'signup':'login'); setError(''); setResetMsg('');}} className="w-full text-center text-xs text-gray-500 hover:text-gold-500 transition mt-2">
           {mode==='login' ? '¿No tienes cuenta? Crear una' : '¿Ya tienes cuenta? Iniciar sesión'}
         </button>
       </div>
@@ -4368,7 +4526,7 @@ function Root() {
   if (!FIREBASE_READY) return <SetupNeeded/>;
   if (!authChecked) return <div className="min-h-screen bg-ink-900 flex items-center justify-center text-gray-500 font-mono text-sm">Cargando ledger…</div>;
   if (!user) return <AuthScreen/>;
-  return <App userId={user.uid} isAdmin={user.email === 'jeffersonshuguli@gmail.com'} onLogout={()=>auth.signOut()}/>;
+  return <App userId={user.uid} userEmail={user.email} isAdmin={user.email === 'jeffersonshuguli@gmail.com'} onLogout={()=>auth.signOut()}/>;
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(<Root/>);
