@@ -490,6 +490,19 @@ function isFixedPaidForMonth(f, y, m) {
   return (f.paidMonths||[]).includes(key);
 }
 
+// para gastos fijos con "valor mensual manual": el monto real de un mes concreto (si ya se puso),
+// si no, usa el valor de referencia (monthlyValue) como estimado.
+function effectiveMonthlyValue(f, y, m) {
+  if (!f.manualMonthlyValue) return f.monthlyValue || 0;
+  const key = `${y}-${String(m+1).padStart(2,'0')}`;
+  const v = (f.monthlyValues||{})[key];
+  return v !== undefined ? v : (f.monthlyValue || 0);
+}
+function effectiveMonthlyValueNow(f) {
+  const now = new Date();
+  return effectiveMonthlyValue(f, now.getFullYear(), now.getMonth());
+}
+
 function downloadBlob(content, filename, type) {
   const blob = new Blob([content], { type });
   const url = URL.createObjectURL(blob);
@@ -582,15 +595,20 @@ function MonthTickBar({ months, onToggle }) {
 
 // ¿qué meses del año actual (enero-diciembre) están pagados para este ítem?
 function yearProgressMonths(item) {
-  const now = new Date();
+  const now = new Date(); now.setHours(0,0,0,0);
   const year = now.getFullYear();
   const curM = now.getMonth();
+  const day = item.paymentDay;
   const months = [];
   for (let m=0; m<12; m++) {
     const started = startedByMonth(item.startDate, year, m);
     let filled;
     if (item.mode === 'auto') {
-      filled = started && m <= curM; // automático: se da por pagado cada mes que ya pasó
+      if (!started) filled = false;
+      else if (!day) filled = m <= curM; // sin día fijo: no hay una fecha exacta que comparar, se mantiene el criterio simple
+      else if (m < curM) filled = true; // meses anteriores ya pasaron completos
+      else if (m > curM) filled = false; // meses futuros todavía no
+      else filled = now >= new Date(year, m, clampDay(day, year, m)); // el mes actual: solo si ya llegó su día de pago
     } else {
       const key = `${year}-${String(m+1).padStart(2,'0')}`;
       filled = started && (item.paidMonths||[]).includes(key);
@@ -983,9 +1001,15 @@ function FixedForm({ initial, accounts, onSave, onClose }) {
         Sin día fijo <span className="text-gray-500 text-xs">(ej. aseo personal, proteína — gastos sin fecha exacta)</span>
       </label>
 
+      <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 bg-paper-200 dark:bg-ink-600 rounded-lg px-3 py-2.5">
+        <input type="checkbox" checked={!!f.manualMonthlyValue} onChange={e=>set('manualMonthlyValue', e.target.checked)} className="accent-gold-500 w-4 h-4"/>
+        Valor mensual manual <span className="text-gray-500 text-xs">(ej. luz, agua — el monto cambia cada mes; lo pones tú al marcarlo pagado)</span>
+      </label>
+
       <div className={f.noPaymentDay ? '' : 'grid grid-cols-2 gap-4'}>
-        <Field label="Valor mensual (€)">
+        <Field label={f.manualMonthlyValue ? "Valor de referencia (€)" : "Valor mensual (€)"}>
           <input type="number" step="0.01" className={inputCls} value={f.monthlyValue} onChange={e=>set('monthlyValue', e.target.value)} required/>
+          {f.manualMonthlyValue && <p className="text-xs text-gray-500 mt-1.5">Solo de referencia mientras no pongas el valor real de un mes.</p>}
         </Field>
         {!f.noPaymentDay && (
           <Field label="Día de pago">
@@ -1605,6 +1629,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const f = fixedExpenses.find(x=>x.id===id);
     if (!f) return;
     const wasPaid = (f.paidMonths||[]).includes(key);
+    const amount = effectiveMonthlyValue(f, year, monthIndex);
     setFixedExpenses(list => list.map(x => {
       if (x.id !== id) return x;
       const has = (x.paidMonths||[]).includes(key);
@@ -1612,7 +1637,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       return {...x, paidMonths};
     }));
     if (f.accountId && !f.paymentDay) {
-      applyBalanceDeltas([{ accountId: f.accountId, delta: wasPaid ? (f.monthlyValue||0) : -(f.monthlyValue||0) }]);
+      applyBalanceDeltas([{ accountId: f.accountId, delta: wasPaid ? amount : -amount }]);
     }
   };
   const upsertProject = (item) => {
@@ -1817,15 +1842,19 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   // igual que toggleFixedMonth: los gastos fijos sin día fijo quedan fuera del motor automático,
   // así que "Marcar como pagado" descuenta el saldo directamente aquí (solo si es la primera vez
   // que se marca este mes, para no descontar dos veces si se hace clic más de una vez).
-  const markFixedPaid = (id) => {
+  const markFixedPaid = (id, amount) => {
     const f = fixedExpenses.find(x=>x.id===id);
     if (!f) return;
     const now = new Date();
     const key = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
     const alreadyPaid = (f.paidMonths||[]).includes(key);
-    setFixedExpenses(l => l.map(x => x.id===id ? {...x, lastPaid: todayISO(), paidMonths: addPaidMonth(x.paidMonths)} : x));
+    const finalAmount = f.manualMonthlyValue ? (Number(amount) || 0) : (f.monthlyValue||0);
+    setFixedExpenses(l => l.map(x => x.id===id
+      ? {...x, lastPaid: todayISO(), paidMonths: addPaidMonth(x.paidMonths),
+         monthlyValues: f.manualMonthlyValue ? {...(x.monthlyValues||{}), [key]: finalAmount} : x.monthlyValues}
+      : x));
     if (!alreadyPaid && f.accountId && !f.paymentDay) {
-      applyBalanceDeltas([{ accountId: f.accountId, delta: -(f.monthlyValue||0) }]);
+      applyBalanceDeltas([{ accountId: f.accountId, delta: -finalAmount }]);
     }
   };
   // deshacer: igual que undoSubPaid para el mes/lastPaid. Si el gasto fijo NO tiene día fijo, el motor
@@ -1836,9 +1865,10 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const now = new Date();
     const key = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
     const wasPaid = (f.paidMonths||[]).includes(key);
+    const amount = effectiveMonthlyValue(f, now.getFullYear(), now.getMonth());
     setFixedExpenses(l => l.map(x => x.id===id ? {...x, lastPaid: null, paidMonths: (x.paidMonths||[]).filter(k=>k!==key)} : x));
     if (wasPaid && f.accountId && !f.paymentDay) {
-      applyBalanceDeltas([{ accountId: f.accountId, delta: (f.monthlyValue||0) }]);
+      applyBalanceDeltas([{ accountId: f.accountId, delta: amount }]);
     }
   };
   const markDebtCyclePaid = (id) => setDebts(l => l.map(d => d.id===id ? {...d, lastPaid: todayISO()} : d));
@@ -1859,13 +1889,13 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const subsMonthlyReal = useMemo(()=> activeSubs.filter(s=>s.frequency!=='annual').reduce((a,s)=>a+(s.monthlyPrice||0),0), [activeSubs]);
   const subsAnnualReal = useMemo(()=> activeSubs.filter(s=>s.frequency==='annual').reduce((a,s)=>a+(s.annualPrice||0),0), [activeSubs]);
   const totalFixedMonthly = useMemo(()=> {
-    const withDay = fixedExpenses.filter(f=>f.paymentDay && fixedCountsThisMonth(f)).reduce((a,f)=>a+f.monthlyValue,0);
-    const noDayPaid = fixedExpenses.filter(f=>!f.paymentDay && isPaidThisCycle(f)).reduce((a,f)=>a+f.monthlyValue,0);
+    const withDay = fixedExpenses.filter(f=>f.paymentDay && fixedCountsThisMonth(f)).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0);
+    const noDayPaid = fixedExpenses.filter(f=>!f.paymentDay && isPaidThisCycle(f)).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0);
     return withDay + noDayPaid;
   }, [fixedExpenses]);
   const fixedWithDayCount = useMemo(()=> fixedExpenses.filter(f=>f.paymentDay).length, [fixedExpenses]);
   const fixedNoDayCount = useMemo(()=> fixedExpenses.filter(f=>!f.paymentDay && !isPaidThisCycle(f)).length, [fixedExpenses]);
-  const fixedNoDayTotal = useMemo(()=> fixedExpenses.filter(f=>!f.paymentDay && !isPaidThisCycle(f)).reduce((a,f)=>a+f.monthlyValue,0), [fixedExpenses]);
+  const fixedNoDayTotal = useMemo(()=> fixedExpenses.filter(f=>!f.paymentDay && !isPaidThisCycle(f)).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0), [fixedExpenses]);
   const totalCommitted = totalDebtMonthly + subsMonthlyReal + totalFixedMonthly;
   // total ahorrado = saldo de las cuentas vinculadas a proyectos + aportes que no fueron a ninguna cuenta
   // (así no contamos dos veces: el dinero que está en una cuenta se cuenta por el saldo, no por el aporte)
@@ -1918,7 +1948,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       for (let idx = startIdx; idx <= curIdx; idx++) {
         const y = Math.floor(idx/12), m = idx%12;
         if (isFixedPaidForMonth(f, y, m)) {
-          out.push({ key:`fixed:${f.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:f.accountId, amount:f.monthlyValue,
+          out.push({ key:`fixed:${f.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:f.accountId, amount:effectiveMonthlyValue(f,y,m),
                      type:'fixed', name:f.name, emoji:f.emoji, date:new Date(y, m, clampDay(f.paymentDay,y,m)) });
         }
       }
@@ -2054,7 +2084,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       const {date,daysUntil} = s.frequency==='annual' ? nextAnnualOccurrence(s.billingDate || todayISO()) : nextOccurrence(s.billingDay);
       rows.push({ id:s.id, type:'sub', name:s.name, emoji:s.emoji, amount: s.frequency==='annual' ? s.annualPrice : s.monthlyPrice, date, daysUntil, mode:s.mode, paidThisCycle: isPaidThisCycle(s) });
     });
-    fixedExpenses.forEach(f => { if (!f.paymentDay) return; const {date,daysUntil} = nextOccurrence(f.paymentDay); rows.push({ id:f.id, type:'fixed', name:f.name, emoji:f.emoji, amount:f.monthlyValue, date, daysUntil, mode:f.mode, paidThisCycle: isPaidThisCycle(f) }); });
+    fixedExpenses.forEach(f => { if (!f.paymentDay) return; const {date,daysUntil} = nextOccurrence(f.paymentDay); rows.push({ id:f.id, type:'fixed', name:f.name, emoji:f.emoji, amount:effectiveMonthlyValueNow(f), date, daysUntil, mode:f.mode, paidThisCycle: isPaidThisCycle(f) }); });
     return rows.filter(r=>r.daysUntil<=14).sort((a,b)=>a.daysUntil-b.daysUntil);
   }, [activeDebts, activeSubs, fixedExpenses]);
 
@@ -2094,7 +2124,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const rows = [];
     debts.forEach(d => rows.push({ tipo:'Deuda', nombre:d.name, valor_mensual:d.monthlyPayment, valor_total:d.totalValue, cuotas: d.noEndDate ? 'Sin fecha límite' : `${effectivePaid(d)}/${d.totalInstallments}`, estado: d.finished?'Finalizada':'Activa', dia_pago:d.paymentDay }));
     subscriptions.forEach(s => rows.push({ tipo:'Suscripción', nombre:s.name, valor_mensual: s.frequency==='annual' ? (s.annualPrice||0)/12 : s.monthlyPrice, valor_total:s.frequency==='annual'?s.annualPrice:'', cuotas:'', estado:s.active?'Activa':'Cancelada', dia_pago:s.billingDay }));
-    fixedExpenses.forEach(f => rows.push({ tipo:'Gasto fijo', nombre:f.name, valor_mensual:f.monthlyValue, valor_total:'', cuotas:'', estado:'Activa', dia_pago:f.paymentDay }));
+    fixedExpenses.forEach(f => rows.push({ tipo:'Gasto fijo', nombre:f.name, valor_mensual:effectiveMonthlyValueNow(f), valor_total:'', cuotas:'', estado:'Activa', dia_pago:f.paymentDay }));
     return rows;
   };
   const exportCSV = () => {
@@ -2107,7 +2137,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(debts.map(d=>({Nombre:d.name, ValorTotal:d.totalValue, CuotaMensual:d.monthlyPayment, CuotasTotales: d.noEndDate?'Sin fecha límite':d.totalInstallments, CuotasPagadas: d.noEndDate?'':effectivePaid(d), DiaPago:d.paymentDay, Estado:d.finished?'Finalizada':'Activa'}))), 'Deudas');
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(subscriptions.map(s=>({Nombre:s.name, Frecuencia:s.frequency==='annual'?'Anual':'Mensual', PrecioMensual:s.monthlyPrice||'', PrecioAnual:s.annualPrice||'', DiaCobro:s.billingDay, FechaCobro:s.billingDate||'', Categoria:s.category, Estado:s.active?'Activa':'Cancelada'}))), 'Suscripciones');
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(fixedExpenses.map(f=>({Nombre:f.name, ValorMensual:f.monthlyValue, DiaPago:f.paymentDay, Categoria:f.category}))), 'GastosFijos');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(fixedExpenses.map(f=>({Nombre:f.name, ValorMensual:effectiveMonthlyValueNow(f), DiaPago:f.paymentDay, Categoria:f.category}))), 'GastosFijos');
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(savingsEntries.map(e=>({Monto:e.amount, Fecha:e.date, Proyecto: savingsProjects.find(p=>p.id===e.projectId)?.name || 'Sin destino', Nota:e.note||''}))), 'Ahorro');
     XLSX.writeFile(wb, 'ledger_compromisos.xlsx');
   };
@@ -2821,6 +2851,87 @@ function SubsView({ subs, accounts, onAdd, onEdit, onDelete, onToggle, onMarkPai
 /* =========================================================================
    GASTOS FIJOS
    ========================================================================= */
+function FixedCard({ f, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggleMonth }) {
+  const daysUntil = f.paymentDay ? nextOccurrence(f.paymentDay).daysUntil : null;
+  const nextDate = f.paymentDay ? nextOccurrence(f.paymentDay).date : null;
+  const now = new Date();
+  const paid = f.paymentDay ? isFixedPaidForMonth(f, now.getFullYear(), now.getMonth()) : isPaidThisCycle(f);
+  // atrasado: el día de este mes ya pasó y nunca se marcó como pagado
+  const overdue = !!f.paymentDay && f.mode!=='auto' && !paid
+    && startedByMonth(f.startDate, now.getFullYear(), now.getMonth())
+    && now.getDate() > clampDay(f.paymentDay, now.getFullYear(), now.getMonth());
+  const paidToday = f.mode==='auto' ? (daysUntil===0 && paid) : (f.lastPaid===todayISO());
+  const displayAmount = effectiveMonthlyValueNow(f);
+
+  const [editingAmount, setEditingAmount] = useState(false);
+  const [amountDraft, setAmountDraft] = useState(displayAmount || '');
+
+  const confirmPaid = () => {
+    onMarkPaid(f.id, Number(amountDraft) || 0);
+    setEditingAmount(false);
+  };
+
+  return (
+    <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex flex-col gap-3 animate-fadein">
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex items-center gap-3 min-w-0">
+          <span className="text-2xl shrink-0">{f.emoji}</span>
+          <div className="min-w-0">
+            <div className="font-medium text-ink-900 dark:text-gray-100 flex items-center gap-2 flex-wrap">
+              <span className="truncate">{f.name}</span>
+              <span className="flex items-center gap-1 text-[10px] uppercase text-gray-500 border border-paper-300 dark:border-ink-500 rounded-full px-1.5 py-0.5 shrink-0">
+                {f.mode==='auto' ? <><IBolt size={10}/> Auto</> : <><IHand size={10}/> Manual</>}
+              </span>
+              {f.manualMonthlyValue && (
+                <span className="text-[10px] uppercase text-gold-500 border border-gold-500/40 rounded-full px-1.5 py-0.5 shrink-0">Monto variable</span>
+              )}
+              <AccountBadge accountId={f.accountId} accounts={accounts}/>
+            </div>
+            <div className="text-gray-500 dark:text-gray-500">{f.category}{nextDate ? ` · ${nextDate.toLocaleDateString('es-ES',{day:'numeric',month:'short'})}` : ' · Sin día fijo'}</div>
+          </div>
+        </div>
+        <div className="flex gap-1 shrink-0">
+          <button onClick={()=>onEdit(f)} className="p-1.5 text-gray-500 hover:text-ink-900 dark:hover:text-gray-200 transition"><IEdit size={16}/></button>
+          <button onClick={()=>onDelete(f)} className="p-1.5 text-gray-500 dark:text-gray-500 hover:text-red-400 transition"><ITrash size={16}/></button>
+        </div>
+      </div>
+      <div className="font-mono text-ink-900 dark:text-gray-100 text-lg">{fmt(displayAmount)}{f.manualMonthlyValue && <span className="text-xs text-gray-500 font-sans"> {paid ? 'este mes' : '(referencia)'}</span>}</div>
+      <MonthTickBar months={yearProgressMonths(f)} onToggle={f.mode!=='auto' ? (idx)=>onToggleMonth(f.id, idx) : undefined}/>
+      <div className="text-[11px] text-gray-500 -mt-1">{yearProgressMonths(f).filter(Boolean).length} de 12 meses de {new Date().getFullYear()}</div>
+      {f.mode!=='auto' && (
+        paid ? (
+          <div className="flex items-center justify-between gap-2">
+            <span className="flex items-center gap-1.5 text-emerald-400 text-xs"><ICheck size={13}/> Pagado este ciclo</span>
+            {paidToday && <button onClick={()=>onUndo(f.id)} className="px-3 py-1.5 rounded-lg text-xs text-gray-500 dark:text-gray-400 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Deshacer</button>}
+          </div>
+        ) : f.manualMonthlyValue ? (
+          editingAmount ? (
+            <div className="flex items-center gap-2">
+              <input type="number" step="0.01" autoFocus className={inputCls+" max-w-[130px]"} value={amountDraft} onChange={e=>setAmountDraft(e.target.value)} onKeyDown={e=>e.key==='Enter' && confirmPaid()}/>
+              <button onClick={confirmPaid} className="flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition"><ICheck size={13}/> Confirmar</button>
+              <button onClick={()=>setEditingAmount(false)} className="px-3 py-1.5 rounded-lg text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600 text-xs transition">Cancelar</button>
+            </div>
+          ) : (
+            <button onClick={()=>{setAmountDraft(displayAmount||''); setEditingAmount(true);}} className="self-start flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition">
+              <ICheck size={13}/> Marcar como pagado
+            </button>
+          )
+        ) : (
+          <button onClick={()=>onMarkPaid(f.id)} className="self-start flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition">
+            <ICheck size={13}/> Marcar como pagado
+          </button>
+        )
+      )}
+      {overdue && (
+        <div className="flex items-center gap-1.5 text-orange-500 text-xs bg-orange-500/10 rounded-lg px-2 py-1.5">
+          <IBell size={13}/> Atrasado: no marcaste el pago de {MESES[now.getMonth()].toLowerCase()}
+        </div>
+      )}
+      {daysUntil!==null && <DueCountdown daysUntil={daysUntil} paid={paid} paidToday={paidToday}/>}
+    </div>
+  );
+}
+
 function FixedView({ items, accounts, onAdd, onEdit, onDelete, onMarkPaid, onUndo, onToggleMonth, totalMonthly, withDayCount, noDayCount, noDayTotal }) {
   const [q, setQ] = useState('');
   const filtered = items.filter(f=>f.name.toLowerCase().includes(q.toLowerCase()))
@@ -2830,7 +2941,7 @@ function FixedView({ items, accounts, onAdd, onEdit, onDelete, onMarkPaid, onUnd
     <div className="flex flex-col gap-5">
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <MiniKpi label="Gastos fijos / mes" value={fmt(totalMonthly)} sub="Lo que aplica este mes" accent={COLORS.fixed} icon={<IReceipt size={13}/>}/>
-        <MiniKpi label="No esenciales" value={fmt(items.filter(f=>f.essential===false).reduce((a,f)=>a+(f.monthlyValue||0),0))} sub="Lo que podrías recortar" accent={COLORS.debt} icon={<IDrop size={13}/>}/>
+        <MiniKpi label="No esenciales" value={fmt(items.filter(f=>f.essential===false).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0))} sub="Lo que podrías recortar" accent={COLORS.debt} icon={<IDrop size={13}/>}/>
         <MiniKpi label="Con día fijo" value={withDayCount} sub="Gasto(s) registrado(s)" accent={COLORS.gold} icon={<ICalendar size={13}/>}/>
         <MiniKpi label="Sin día fijo" value={noDayCount} sub={noDayCount>0 ? `Pendiente(s): ${fmt(noDayTotal)}` : 'Todo al día'} accent={COLORS.sub} icon={<ICalendar size={13}/>}/>
       </div>
@@ -2840,61 +2951,7 @@ function FixedView({ items, accounts, onAdd, onEdit, onDelete, onMarkPaid, onUnd
       </div>
       {filtered.length===0 && <EmptyState text="No hay gastos fijos registrados todavía." onAdd={onAdd} cta="Añadir gasto fijo"/>}
       {(() => {
-        const renderCard = (f) => {
-          const daysUntil = f.paymentDay ? nextOccurrence(f.paymentDay).daysUntil : null;
-          const nextDate = f.paymentDay ? nextOccurrence(f.paymentDay).date : null;
-          const now = new Date();
-          const paid = f.paymentDay ? isFixedPaidForMonth(f, now.getFullYear(), now.getMonth()) : isPaidThisCycle(f);
-          // atrasado: el día de este mes ya pasó y nunca se marcó como pagado
-          const overdue = !!f.paymentDay && f.mode!=='auto' && !paid
-            && startedByMonth(f.startDate, now.getFullYear(), now.getMonth())
-            && now.getDate() > clampDay(f.paymentDay, now.getFullYear(), now.getMonth());
-          const paidToday = f.mode==='auto' ? (daysUntil===0 && paid) : (f.lastPaid===todayISO());
-          return (
-          <div key={f.id} className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex flex-col gap-3 animate-fadein">
-            <div className="flex items-start justify-between gap-2">
-              <div className="flex items-center gap-3 min-w-0">
-                <span className="text-2xl shrink-0">{f.emoji}</span>
-                <div className="min-w-0">
-                  <div className="font-medium text-ink-900 dark:text-gray-100 flex items-center gap-2 flex-wrap">
-                    <span className="truncate">{f.name}</span>
-                    <span className="flex items-center gap-1 text-[10px] uppercase text-gray-500 border border-paper-300 dark:border-ink-500 rounded-full px-1.5 py-0.5 shrink-0">
-                      {f.mode==='auto' ? <><IBolt size={10}/> Auto</> : <><IHand size={10}/> Manual</>}
-                    </span>
-                    <AccountBadge accountId={f.accountId} accounts={accounts}/>
-                  </div>
-                  <div className="text-gray-500 dark:text-gray-500">{f.category}{nextDate ? ` · ${nextDate.toLocaleDateString('es-ES',{day:'numeric',month:'short'})}` : ' · Sin día fijo'}</div>
-                </div>
-              </div>
-              <div className="flex gap-1 shrink-0">
-                <button onClick={()=>onEdit(f)} className="p-1.5 text-gray-500 hover:text-ink-900 dark:hover:text-gray-200 transition"><IEdit size={16}/></button>
-                <button onClick={()=>onDelete(f)} className="p-1.5 text-gray-500 dark:text-gray-500 hover:text-red-400 transition"><ITrash size={16}/></button>
-              </div>
-            </div>
-            <div className="font-mono text-ink-900 dark:text-gray-100 text-lg">{fmt(f.monthlyValue)}</div>
-            <MonthTickBar months={yearProgressMonths(f)} onToggle={f.mode!=='auto' ? (idx)=>onToggleMonth(f.id, idx) : undefined}/>
-            <div className="text-[11px] text-gray-500 -mt-1">{yearProgressMonths(f).filter(Boolean).length} de 12 meses de {new Date().getFullYear()}</div>
-            {f.mode!=='auto' && (
-              paid ? (
-                <div className="flex items-center justify-between gap-2">
-                  <span className="flex items-center gap-1.5 text-emerald-400 text-xs"><ICheck size={13}/> Pagado este ciclo</span>
-                  {paidToday && <button onClick={()=>onUndo(f.id)} className="px-3 py-1.5 rounded-lg text-xs text-gray-500 dark:text-gray-400 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Deshacer</button>}
-                </div>
-              ) : (
-                <button onClick={()=>onMarkPaid(f.id)} className="self-start flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition">
-                  <ICheck size={13}/> Marcar como pagado
-                </button>
-              )
-            )}
-            {overdue && (
-              <div className="flex items-center gap-1.5 text-orange-500 text-xs bg-orange-500/10 rounded-lg px-2 py-1.5">
-                <IBell size={13}/> Atrasado: no marcaste el pago de {MESES[now.getMonth()].toLowerCase()}
-              </div>
-            )}
-            {daysUntil!==null && <DueCountdown daysUntil={daysUntil} paid={paid} paidToday={paidToday}/>}
-          </div>
-          );
-        };
+        const renderCard = (f) => <FixedCard key={f.id} f={f} accounts={accounts} onEdit={onEdit} onDelete={onDelete} onMarkPaid={onMarkPaid} onUndo={onUndo} onToggleMonth={onToggleMonth}/>;
 
         // esencial por defecto: si nunca se marcó, se considera esencial
         const esenciales = filtered.filter(f => f.essential !== false);
@@ -3365,7 +3422,7 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
   const monthlyOut =
     linkedDebts.reduce((s,d)=>s+(d.monthlyPayment||0),0) +
     linkedSubs.filter(s=>s.active && s.frequency!=='annual').reduce((s,x)=>s+(x.monthlyPrice||0),0) +
-    linkedFixed.reduce((s,f)=>s+(f.monthlyValue||0),0);
+    linkedFixed.reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
 
   const Row = ({ emoji, title, subtitle, amount, positive, onEdit, onDelete }) => (
     <div className="flex items-center gap-3 py-2.5 border-t border-paper-300/60 dark:border-ink-500/40">
@@ -3530,7 +3587,7 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
           {linkedFixed.map(f => (
             <Row key={f.id} emoji={f.emoji} title={f.name}
               subtitle={f.paymentDay ? `Día ${f.paymentDay} de cada mes` : 'Sin día fijo'}
-              amount={f.monthlyValue} positive={false}
+              amount={effectiveMonthlyValueNow(f)} positive={false}
               onEdit={()=>onEditFixed(f)} onDelete={()=>onDeleteFixed(f)}/>
           ))}
         </MiniCollapsible>
@@ -4049,7 +4106,7 @@ function RuleCard({ r, totalIncome, accountName, debts, subs, fixed, antBudget, 
     if (li.type==='savings') return sum + (savingsBudget||0);
     if (li.type==='debt') { const d = debts.find(x=>x.id===li.id); return sum + (d ? d.monthlyPayment : 0); }
     if (li.type==='sub') { const s = subs.find(x=>x.id===li.id); return sum + (s ? monthlySub(s) : 0); }
-    if (li.type==='fixed') { const f = fixed.find(x=>x.id===li.id); return sum + (f ? f.monthlyValue : 0); }
+    if (li.type==='fixed') { const f = fixed.find(x=>x.id===li.id); return sum + (f ? effectiveMonthlyValueNow(f) : 0); }
     return sum;
   }, 0), [linked, debts, subs, fixed, antBudget, savingsBudget]);
 
@@ -4093,7 +4150,7 @@ function RuleCard({ r, totalIncome, accountName, debts, subs, fixed, antBudget, 
           </MiniCollapsible>
           <MiniCollapsible title="Gastos fijos" count={fixed.length}>
             {fixed.map(f => (
-              <ToggleRow key={f.id} emoji={f.emoji} name={f.name} amount={f.monthlyValue} active={isLinked('fixed', f.id)} onToggle={()=>onToggleLinkedItem(r.id, 'fixed', f.id)}/>
+              <ToggleRow key={f.id} emoji={f.emoji} name={f.name} amount={effectiveMonthlyValueNow(f)} active={isLinked('fixed', f.id)} onToggle={()=>onToggleLinkedItem(r.id, 'fixed', f.id)}/>
             ))}
           </MiniCollapsible>
           <ToggleRow emoji="🐜" name={`Gastos hormiga (${fmt(antBudget||0)}/mes)`} amount={null} active={isLinked('ants')} onToggle={()=>onToggleLinkedItem(r.id, 'ants')}/>
@@ -4281,13 +4338,13 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
     fixed.forEach(f => {
       if (f.paymentDay && startedByMonth(f.startDate, y, m) && clampDay(f.paymentDay,y,m)===day) {
         const paid = isFixedPaidForMonth(f, y, m);
-        list.push({type:'fixed', name:f.name, emoji:f.emoji, amount:f.monthlyValue, paid, overdue: isPast && !paid});
+        list.push({type:'fixed', name:f.name, emoji:f.emoji, amount:effectiveMonthlyValue(f,y,m), paid, overdue: isPast && !paid});
       } else if (!f.paymentDay && f.lastPaid) {
         // sin día fijo no hay una fecha programada de la que colgarse, así que lo mostramos
         // en el día real en que lo marcaste pagado (nunca como "atrasado", porque no tiene fecha límite)
         const lp = new Date(f.lastPaid);
         if (lp.getFullYear()===y && lp.getMonth()===m && lp.getDate()===day) {
-          list.push({type:'fixed', name:f.name, emoji:f.emoji, amount:f.monthlyValue, paid:true, overdue:false});
+          list.push({type:'fixed', name:f.name, emoji:f.emoji, amount:effectiveMonthlyValue(f,y,m), paid:true, overdue:false});
         }
       }
     });
