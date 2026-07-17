@@ -2488,7 +2488,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
             <main className="p-4 md:p-8 pb-24 md:pb-8 max-w-6xl mx-auto">
               {view==='dashboard' && (
                 <Dashboard
-                  totalCommitted={totalCommitted} totalDebtMonthly={totalDebtMonthly} totalDebtPending={totalDebtPending}
+                  totalCommitted={totalCommitted} pendingThisMonth={pendingThisMonth} totalDebtMonthly={totalDebtMonthly} totalDebtPending={totalDebtPending}
                   totalSubMonthly={subsMonthlyReal} totalFixedMonthly={totalFixedMonthly} totalSaved={totalSaved}
                   monthsToFreedom={monthsToFreedom} freedomDate={freedomDate}
                   distribution={distribution} upcoming={upcoming} reminders={reminders}
@@ -2708,7 +2708,7 @@ function AddButton({ view, onAdd }) {
 /* =========================================================================
    DASHBOARD
    ========================================================================= */
-function Dashboard({ totalCommitted, totalDebtMonthly, totalDebtPending, totalSubMonthly, totalFixedMonthly, totalSaved, monthsToFreedom, freedomDate, distribution, upcoming, reminders, activeDebtsCount, incomeThisMonth, antThisMonth, netFlowThisMonth, hasIncomeData, netWorth, hasAccounts }) {
+function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDebtPending, totalSubMonthly, totalFixedMonthly, totalSaved, monthsToFreedom, freedomDate, distribution, upcoming, reminders, activeDebtsCount, incomeThisMonth, antThisMonth, netFlowThisMonth, hasIncomeData, netWorth, hasAccounts }) {
   return (
     <div className="flex flex-col gap-6">
       {reminders.length>0 && (
