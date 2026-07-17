@@ -120,6 +120,9 @@ interface Subscription {
   billingDay: number;
   category: string;
   active: boolean;
+  manualMonthlyValue?: boolean; // el monto de cada ciclo se pone a mano al marcarlo pagado
+  monthlyValues?: { [period: string]: number }; // monto real de cada ciclo (mes "YYYY-MM", o año "YYYY" si es anual)
+  dateOverrides?: { [month: string]: number }; // si arrastraste esta ocurrencia en el Calendario a otro día del mismo mes
 }
 
 interface FixedExpense {
@@ -129,6 +132,7 @@ interface FixedExpense {
   monthlyValue: number;
   paymentDay: number;
   category: string;
+  dateOverrides?: { [month: string]: number }; // si arrastraste esta ocurrencia en el Calendario a otro día del mismo mes
 }
 
 interface IncomeSplitRule {
@@ -284,6 +288,20 @@ function accountBalanceInEur(account, rate) {
   return account.currency==='USD' ? bal * (rate>0 ? rate : 1) : bal;
 }
 
+// orden compartido para cualquier selector de cuentas: cada cuenta normal, seguida justo
+// debajo de sus pockets (para que se vean agrupados en vez de mezclados sueltos)
+function orderedAccountsForSelect(accounts) {
+  const list = accounts || [];
+  const parents = list.filter(a => !a.parentAccountId);
+  const out = [];
+  parents.forEach(p => {
+    out.push(p);
+    list.filter(a => a.parentAccountId === p.id).forEach(pocket => out.push(pocket));
+  });
+  list.filter(a => a.parentAccountId && !parents.some(p=>p.id===a.parentAccountId)).forEach(orphan => out.push(orphan));
+  return out;
+}
+
 function fmt(n) {
   const v = Number(n) || 0;
   return v.toLocaleString('es-ES', { style:'currency', currency:'EUR', maximumFractionDigits: 2 });
@@ -318,21 +336,52 @@ function nextOccurrence(paymentDay) {
   const daysUntil = Math.round(diffMs / 86400000);
   return { date: target, daysUntil };
 }
+// igual que nextOccurrence, pero para una suscripción/gasto fijo puntual: si arrastraste su
+// ocurrencia de este mes a otro día en el Calendario, usa ese día en vez del día de pago de
+// fábrica — y en cuanto ese mes queda atrás, vuelve solo al día normal para el mes siguiente.
+function nextOccurrenceForItem(item, defaultDay) {
+  const today = new Date(); today.setHours(0,0,0,0);
+  let y = today.getFullYear(), m = today.getMonth();
+  let day = effectiveDay(item, y, m, defaultDay);
+  let cursor = new Date(y, m, clampDay(day, y, m));
+  while (cursor < today) {
+    m++; if (m > 11) { m = 0; y++; }
+    day = effectiveDay(item, y, m, defaultDay);
+    cursor = new Date(y, m, clampDay(day, y, m));
+  }
+  const daysUntil = Math.round((cursor.getTime() - today.getTime()) / 86400000);
+  return { date: cursor, daysUntil };
+}
 
 // próximo pago programado de una deuda: respeta la fecha del PRIMER pago (no solo el día del mes),
 // así que si el primer pago todavía no llega, no la marca como "vence hoy" antes de tiempo
 function nextDebtOccurrence(debt) {
   const today = new Date(); today.setHours(0,0,0,0);
   const first = new Date(debt.firstPaymentDate); first.setHours(0,0,0,0);
-  // firstPaymentDate solo marca DESDE QUÉ MES arranca la deuda; el día del mes lo manda siempre
-  // paymentDay (mismo criterio que usan el Calendario y el motor de pagos), así que si editas
-  // "Día del mes de pago" se refleja aquí también, sin tener que tocar también la fecha del primer pago.
-  let y = first.getFullYear(), m = first.getMonth();
-  let cursor = new Date(y, m, clampDay(debt.paymentDay, y, m));
-  while (cursor < today) {
-    m++; if (m > 11) { m = 0; y++; }
-    cursor = new Date(y, m, clampDay(debt.paymentDay, y, m));
+  const fy = first.getFullYear(), fm = first.getMonth();
+
+  if (debt.mode === 'auto' || debt.noEndDate) {
+    // automático (o sin fecha límite): la ocurrencia es la próxima fecha desde HOY, según el día
+    // de pago. Tiene sentido porque en estos casos las cuotas pagadas siempre están al día con
+    // el calendario real (se ponen al día solas).
+    let y = fy, m = fm;
+    let cursor = new Date(y, m, clampDay(debt.paymentDay, y, m));
+    while (cursor < today) {
+      m++; if (m > 11) { m = 0; y++; }
+      cursor = new Date(y, m, clampDay(debt.paymentDay, y, m));
+    }
+    const daysUntil = Math.round((cursor.getTime() - today.getTime()) / 86400000);
+    return { date: cursor, daysUntil };
   }
+
+  // manual: la próxima cuota es la que sigue a las que YA marcaste como pagadas (paidInstallments),
+  // sin importar si esa fecha ya pasó — así, si te atrasaste, se ve atrasada de verdad en vez de
+  // saltarse sola al mes de hoy (que antes hacía que pareciera "al día" sin estarlo).
+  const idx = debt.paidInstallments || 0;
+  let cm = fm + idx;
+  let cy = fy + Math.floor(cm/12);
+  cm = ((cm % 12) + 12) % 12;
+  const cursor = new Date(cy, cm, clampDay(debt.paymentDay, cy, cm));
   const daysUntil = Math.round((cursor.getTime() - today.getTime()) / 86400000);
   return { date: cursor, daysUntil };
 }
@@ -437,15 +486,23 @@ function isPaidThisCycle(item) {
   return isSameMonth(item.lastPaid, new Date());
 }
 
-// ¿cuenta esta deuda en el total comprometido de ESTE mes?
-// regla única: solo si su PRÓXIMO pago cae dentro del mes actual.
-// (si la cuota de este mes ya se pagó, su próximo pago salta al mes siguiente → ya pertenece a ese mes, no a este)
+// ¿tiene esta deuda una cuota programada en el mes actual? FIJO durante todo el mes — no cambia
+// aunque ya la hayas pagado (para eso está la etiqueta "Pagado", no para que desaparezca del total).
 function debtCountsThisMonth(debt) {
-  return debtOccursThisMonth(debt);
+  if (debt.finished) return false;
+  const now = new Date();
+  const curIdx = now.getFullYear()*12 + now.getMonth();
+  const first = new Date(debt.firstPaymentDate);
+  const firstIdx = first.getFullYear()*12 + first.getMonth();
+  if (curIdx < firstIdx) return false;
+  if (debt.noEndDate) return true;
+  const totalInstallments = debt.totalInstallments || Infinity;
+  return (curIdx - firstIdx) < totalInstallments;
 }
-// misma regla para un gasto fijo con día
+// misma idea para un gasto fijo con día: cuenta desde que empezó, estable durante todo el mes
 function fixedCountsThisMonth(f) {
-  return occursThisMonth(f.paymentDay, f.startDate);
+  const now = new Date();
+  return startedByMonth(f.startDate, now.getFullYear(), now.getMonth());
 }
 function installmentIndexAt(debt, y, m) {
   const targetEnd = new Date(y, m, clampDay(debt.paymentDay, y, m)); targetEnd.setHours(0,0,0,0);
@@ -457,8 +514,18 @@ function installmentIndexAt(debt, y, m) {
   return count;
 }
 // ¿está pagada la ocurrencia de esta deuda en el mes (y,m) del calendario?
+// día efectivo de una ocurrencia en (y,m): normalmente es el día de pago de siempre, pero si
+// arrastraste esa ocurrencia en el Calendario a otro día de ESE MISMO mes, usa ese día en su lugar.
+// Esto NUNCA toca el día de pago "de fábrica" del ítem (firstPaymentDate/paymentDay/billingDay),
+// solo corrige la fecha mostrada y usada para ESE mes puntual.
+function effectiveDay(item, y, m, defaultDay) {
+  const key = `${y}-${String(m+1).padStart(2,'0')}`;
+  const override = (item.dateOverrides||{})[key];
+  return override || defaultDay;
+}
+
 function isDebtPaidForOccurrence(debt, y, m) {
-  const occ = new Date(y, m, clampDay(debt.paymentDay, y, m)); occ.setHours(0,0,0,0);
+  const occ = new Date(y, m, clampDay(effectiveDay(debt,y,m,debt.paymentDay), y, m)); occ.setHours(0,0,0,0);
   const today0 = new Date(); today0.setHours(0,0,0,0);
   if (debt.mode === 'auto') return occ <= today0; // "automático" solo se da por pagado una vez que la fecha ya llegó
   if (debt.noEndDate) {
@@ -483,7 +550,7 @@ function isRecurringPaidForOccurrence(item, y, m, day) {
 
 // para GASTOS FIJOS el registro real de pagos es la barra de 12 meses (paidMonths), así que el calendario la consulta a ella
 function isFixedPaidForMonth(f, y, m) {
-  const occ = new Date(y, m, clampDay(f.paymentDay, y, m)); occ.setHours(0,0,0,0);
+  const occ = new Date(y, m, clampDay(effectiveDay(f,y,m,f.paymentDay), y, m)); occ.setHours(0,0,0,0);
   const today0 = new Date(); today0.setHours(0,0,0,0);
   if (f.mode === 'auto') return occ <= today0;
   const key = `${y}-${String(m+1).padStart(2,'0')}`;
@@ -501,6 +568,23 @@ function effectiveMonthlyValue(f, y, m) {
 function effectiveMonthlyValueNow(f) {
   const now = new Date();
   return effectiveMonthlyValue(f, now.getFullYear(), now.getMonth());
+}
+
+// para suscripciones con "valor manual": mensuales usan clave "YYYY-MM", anuales usan clave "YYYY"
+// (un solo cobro al año). Si no hay valor puesto para ese ciclo, usa el precio de referencia.
+function subPeriodKey(s, y, m) {
+  return s.frequency==='annual' ? `${y}` : `${y}-${String(m+1).padStart(2,'0')}`;
+}
+function effectiveSubValue(s, y, m) {
+  const base = s.frequency==='annual' ? (s.annualPrice||0) : (s.monthlyPrice||0);
+  if (!s.manualMonthlyValue) return base;
+  const key = subPeriodKey(s, y, m);
+  const v = (s.monthlyValues||{})[key];
+  return v !== undefined ? v : base;
+}
+function effectiveSubValueNow(s) {
+  const now = new Date();
+  return effectiveSubValue(s, now.getFullYear(), now.getMonth());
 }
 
 function downloadBlob(content, filename, type) {
@@ -556,6 +640,8 @@ const IFilter = (p) => <Icon {...p}><path d="M3.5 5h17L14 13.5V19l-4 2v-7.5Z"/><
 const IWallet = (p) => <Icon {...p}><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h11A2.5 2.5 0 0 1 19 7.5"/><rect x="3" y="7.5" width="18" height="12" rx="2"/><circle cx="16" cy="13.5" r="1.4"/></Icon>;
 const IPiggy = (p) => <Icon {...p}><path d="M4 12a6 6 0 0 1 6-6h4a6 6 0 0 1 6 4h1.5l-1 2.5-2.5.5v2l-2 2h-2l-1-1.5h-3L8.5 18h-2l-1-2.5A5 5 0 0 1 4 12Z"/><circle cx="15.5" cy="10.5" r="0.8" fill="currentColor" stroke="none"/><path d="M9.5 6V4M6 7.5 4.5 6"/></Icon>;
 const IArrowDown = (p) => <Icon {...p}><path d="M12 4v14"/><path d="M6 12l6 6 6-6"/></Icon>;
+const IArrowRight = (p) => <Icon {...p}><path d="M4 12h14"/><path d="M12 6l6 6-6 6"/></Icon>;
+const IArrowLeft = (p) => <Icon {...p}><path d="M20 12H6"/><path d="M12 18l-6-6 6-6"/></Icon>;
 const IDrop = (p) => <Icon {...p}><path d="M12 3c3 4 6.5 7.8 6.5 11.3A6.5 6.5 0 1 1 5.5 14.3C5.5 10.8 9 7 12 3Z"/></Icon>;
 const IBank = (p) => <Icon {...p}><path d="M3 10h18M5 10v8m4-8v8m6-8v8m4-8v8M3 18h18M12 3 3 8h18l-9-5Z"/></Icon>;
 const IBolt = (p) => <Icon {...p}><path d="M13 2.5 4.5 14h5.5l-1 7.5L19 10h-5.5Z"/></Icon>;
@@ -790,12 +876,13 @@ function ConfirmDialog({ text, onConfirm, onCancel }) {
    ========================================================================= */
 // selector de cuenta reutilizable — de qué cuenta sale este pago
 function AccountField({ accounts, value, onChange, label }) {
+  const ordered = orderedAccountsForSelect(accounts);
   return (
     <Field label={label || "Cuenta de pago"}>
       <select className={inputCls} value={value||''} onChange={e=>onChange(e.target.value || null)}>
         <option value="">Sin asignar</option>
-        {(accounts||[]).map(a => (
-          <option key={a.id} value={a.id}>{a.emoji} {a.name}{a.currency==='USD' ? ' (USD)' : ''}{!a.active ? ' (inactiva)' : ''}</option>
+        {ordered.map(a => (
+          <option key={a.id} value={a.id}>{a.parentAccountId ? '↳ ' : ''}{a.emoji} {a.name}{a.currency==='USD' ? ' (USD)' : ''}{!a.active ? ' (inactiva)' : ''}</option>
         ))}
       </select>
       {(!accounts || accounts.length===0) && (
@@ -923,8 +1010,9 @@ function SubscriptionForm({ initial, accounts, onSave, onClose }) {
 
       {!isAnnual ? (
         <div className="grid grid-cols-2 gap-4">
-          <Field label="Precio mensual (€)">
+          <Field label={f.manualMonthlyValue ? "Precio de referencia (€)" : "Precio mensual (€)"}>
             <input type="number" step="0.01" className={inputCls} value={f.monthlyPrice} onChange={e=>set('monthlyPrice', e.target.value)} required/>
+            {f.manualMonthlyValue && <p className="text-xs text-gray-500 mt-1.5">Solo de referencia mientras no pongas el valor real de un ciclo.</p>}
           </Field>
           <Field label="Día de cobro">
             <input type="number" min="1" max="31" className={inputCls} value={f.billingDay} onChange={e=>set('billingDay', e.target.value)}/>
@@ -932,14 +1020,20 @@ function SubscriptionForm({ initial, accounts, onSave, onClose }) {
         </div>
       ) : (
         <div className="grid grid-cols-2 gap-4">
-          <Field label="Precio anual (€)">
+          <Field label={f.manualMonthlyValue ? "Precio de referencia (€)" : "Precio anual (€)"}>
             <input type="number" step="0.01" className={inputCls} value={f.annualPrice} onChange={e=>set('annualPrice', e.target.value)} required/>
+            {f.manualMonthlyValue && <p className="text-xs text-gray-500 mt-1.5">Solo de referencia mientras no pongas el valor real de un ciclo.</p>}
           </Field>
           <Field label="Fecha de cobro">
             <input type="date" className={inputCls} value={f.billingDate} onChange={e=>set('billingDate', e.target.value)}/>
           </Field>
         </div>
       )}
+
+      <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 bg-paper-200 dark:bg-ink-600 rounded-lg px-3 py-2.5">
+        <input type="checkbox" checked={!!f.manualMonthlyValue} onChange={e=>set('manualMonthlyValue', e.target.checked)} className="accent-gold-500 w-4 h-4"/>
+        {isAnnual ? 'Valor anual manual' : 'Valor mensual manual'} <span className="text-gray-500 text-xs">(el monto cambia cada ciclo; lo pones tú al marcarla pagada)</span>
+      </label>
 
       {!isAnnual && (
         <Field label="Fecha de inicio">
@@ -1065,7 +1159,7 @@ function SavingsProjectForm({ initial, accounts, onSave, onClose }) {
       <Field label="Cuenta vinculada (opcional)">
         <select className={inputCls} value={f.accountId||''} onChange={e=>set('accountId', e.target.value)}>
           <option value="">Sin cuenta vinculada</option>
-          {(accounts||[]).map(a => <option key={a.id} value={a.id}>{a.emoji} {a.name}</option>)}
+          {orderedAccountsForSelect(accounts).map(a => <option key={a.id} value={a.id}>{a.parentAccountId ? '↳ ' : ''}{a.emoji} {a.name}</option>)}
         </select>
         <p className="text-xs text-gray-500 mt-1.5">
           Si vinculas una cuenta, el saldo de esa cuenta pasa a ser lo ahorrado en este proyecto — cuenta y proyecto funcionan como uno solo.
@@ -1167,14 +1261,16 @@ function SavingsEntryForm({ initial, projects, accounts, onSave, onClose }) {
   );
 }
 
-function AccountForm({ initial, onSave, onClose }) {
-  const [f, setF] = useState(initial || { name:'', emoji:'🏦', balance:'', active:true, includeInNet:true, note:'', currency:'EUR' });
+function AccountForm({ initial, accounts, defaultParentId, onSave, onClose }) {
+  const [f, setF] = useState(initial || { name:'', emoji:'🏦', balance:'', active:true, includeInNet:true, note:'', currency:'EUR', parentAccountId: defaultParentId || null });
   const set = (k,v) => setF(s=>({...s,[k]:v}));
   const submit = (e) => {
     e.preventDefault();
     if (!f.name || f.balance==='') return;
     onSave({ ...f, balance:Number(f.balance), currency: f.currency || 'EUR' });
   };
+  // solo cuentas "de verdad" (sin madre propia) pueden ser cuenta madre — así no se anidan pockets dentro de pockets
+  const possibleParents = (accounts||[]).filter(a => !a.parentAccountId && a.id !== (initial && initial.id));
   return (
     <form onSubmit={submit} className="flex flex-col gap-4">
       <div className="grid grid-cols-[64px_1fr] gap-3">
@@ -1185,6 +1281,15 @@ function AccountForm({ initial, onSave, onClose }) {
           <input className={inputCls} placeholder="Ej. N26, Revolut, BBVA..." value={f.name} onChange={e=>set('name', e.target.value)} required autoFocus/>
         </Field>
       </div>
+      {possibleParents.length>0 && (
+        <Field label="Cuenta principal (opcional)">
+          <select className={inputCls} value={f.parentAccountId||''} onChange={e=>set('parentAccountId', e.target.value||null)}>
+            <option value="">Ninguna — es una cuenta normal</option>
+            {possibleParents.map(a => <option key={a.id} value={a.id}>{a.emoji} {a.name} (pocket dentro de esta)</option>)}
+          </select>
+          <p className="text-xs text-gray-500 mt-1.5">Si eliges una, esta cuenta se vuelve un "pocket" — su saldo es propio y separado, no se suma solo al de la cuenta principal.</p>
+        </Field>
+      )}
       <div className="grid grid-cols-[1fr_120px] gap-3">
         <Field label={`Saldo actual (${(CURRENCIES[f.currency||'EUR']).symbol})`}>
           <input type="number" step="0.01" className={inputCls} value={f.balance} onChange={e=>set('balance', e.target.value)} required/>
@@ -1248,13 +1353,13 @@ function TransferForm({ initial, accounts, onSave, onClose }) {
         <Field label="Desde (sale de)">
           <select className={inputCls} value={f.fromAccountId} onChange={e=>set('fromAccountId', e.target.value)} required>
             <option value="">Elige una cuenta</option>
-            {(accounts||[]).map(a => <option key={a.id} value={a.id}>{a.emoji} {a.name}</option>)}
+            {orderedAccountsForSelect(accounts).map(a => <option key={a.id} value={a.id}>{a.parentAccountId ? '↳ ' : ''}{a.emoji} {a.name}</option>)}
           </select>
         </Field>
         <Field label="Hacia (entra en)">
           <select className={inputCls} value={f.toAccountId} onChange={e=>set('toAccountId', e.target.value)} required>
             <option value="">Elige una cuenta</option>
-            {(accounts||[]).map(a => <option key={a.id} value={a.id}>{a.emoji} {a.name}</option>)}
+            {orderedAccountsForSelect(accounts).map(a => <option key={a.id} value={a.id}>{a.parentAccountId ? '↳ ' : ''}{a.emoji} {a.name}</option>)}
           </select>
         </Field>
       </div>
@@ -1304,7 +1409,7 @@ function IncomeForm({ initial, accounts, onSave, onClose }) {
       <Field label="Entra en la cuenta">
         <select className={inputCls} value={f.accountId||''} onChange={e=>set('accountId', e.target.value)}>
           <option value="">Sin asignar</option>
-          {(accounts||[]).map(a => <option key={a.id} value={a.id}>{a.emoji} {a.name}</option>)}
+          {orderedAccountsForSelect(accounts).map(a => <option key={a.id} value={a.id}>{a.parentAccountId ? '↳ ' : ''}{a.emoji} {a.name}</option>)}
         </select>
         {!isEdit && f.accountId && (
           <p className="text-xs text-emerald-400 mt-1.5">Al guardar, este monto se sumará al saldo de esa cuenta.</p>
@@ -1352,7 +1457,7 @@ function AntExpenseForm({ initial, accounts, onSave, onClose }) {
       <Field label="Sale de la cuenta">
         <select className={inputCls} value={f.accountId||''} onChange={e=>set('accountId', e.target.value)}>
           <option value="">Sin asignar</option>
-          {(accounts||[]).map(a => <option key={a.id} value={a.id}>{a.emoji} {a.name}</option>)}
+          {orderedAccountsForSelect(accounts).map(a => <option key={a.id} value={a.id}>{a.parentAccountId ? '↳ ' : ''}{a.emoji} {a.name}</option>)}
         </select>
         {!isEdit && f.accountId && (
           <p className="text-xs text-red-400 mt-1.5">Al guardar, este monto se descontará del saldo de esa cuenta.</p>
@@ -1570,6 +1675,22 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     }, 150);
     return () => clearTimeout(t);
   }, [debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, appliedPayments, monthlyHistory, theme, exchangeRate, loaded, store]);
+
+  // descarga un archivo .json con TODOS los datos tal como están ahora mismo — una copia de
+  // seguridad tuya, en tu computadora, que no depende de mí ni de Firebase.
+  const exportBackup = () => {
+    const data = latestSnapshotRef.current;
+    if (!data) return;
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `ledger-backup-${todayISO()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
 
   // red de seguridad: si la página se cierra, se recarga o se cambia de pestaña ANTES de que
   // el margen de arriba llegue a disparar el guardado, forzamos un guardado inmediato con lo
@@ -1815,13 +1936,19 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const toggleSubActive = (id) => setSubscriptions(l => l.map(s => s.id===id ? {...s, active: !s.active} : s));
   // las suscripciones ANUALES quedan totalmente fuera del motor automático (que solo sabe iterar
   // meses), así que igual que con los gastos fijos sin día, aquí se descuenta/devuelve directo.
-  const markSubPaid = (id) => {
+  const markSubPaid = (id, amount) => {
     const s = subscriptions.find(x=>x.id===id);
     if (!s) return;
+    const now = new Date();
+    const key = subPeriodKey(s, now.getFullYear(), now.getMonth());
     const isNewAnnualCycle = s.frequency==='annual' && !isPaidThisCycle(s);
-    setSubscriptions(l => l.map(x => x.id===id ? {...x, lastPaid: todayISO(), paidMonths: addPaidMonth(x.paidMonths)} : x));
+    const finalAmount = s.manualMonthlyValue ? (Number(amount) || 0) : (s.annualPrice||0);
+    setSubscriptions(l => l.map(x => x.id===id
+      ? {...x, lastPaid: todayISO(), paidMonths: addPaidMonth(x.paidMonths),
+         monthlyValues: s.manualMonthlyValue ? {...(x.monthlyValues||{}), [key]: finalAmount} : x.monthlyValues}
+      : x));
     if (isNewAnnualCycle && s.accountId) {
-      applyBalanceDeltas([{ accountId: s.accountId, delta: -(s.annualPrice||0) }]);
+      applyBalanceDeltas([{ accountId: s.accountId, delta: -finalAmount }]);
     }
   };
   // deshacer: quitamos el mes actual de paidMonths y limpiamos lastPaid (así isPaidThisCycle vuelve a
@@ -1832,11 +1959,12 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const s = subscriptions.find(x=>x.id===id);
     if (!s) return;
     const now = new Date();
-    const key = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+    const key = subPeriodKey(s, now.getFullYear(), now.getMonth());
     const wasPaidThisCycle = isPaidThisCycle(s);
+    const amount = effectiveSubValueNow(s);
     setSubscriptions(l => l.map(x => x.id===id ? {...x, lastPaid: null, paidMonths: (x.paidMonths||[]).filter(k=>k!==key)} : x));
     if (s.frequency==='annual' && wasPaidThisCycle && s.accountId) {
-      applyBalanceDeltas([{ accountId: s.accountId, delta: (s.annualPrice||0) }]);
+      applyBalanceDeltas([{ accountId: s.accountId, delta: amount }]);
     }
   };
   // igual que toggleFixedMonth: los gastos fijos sin día fijo quedan fuera del motor automático,
@@ -1873,6 +2001,38 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   };
   const markDebtCyclePaid = (id) => setDebts(l => l.map(d => d.id===id ? {...d, lastPaid: todayISO()} : d));
 
+  // arrastrar en el Calendario: reprograma a qué DÍA de ESE mismo mes corresponde una ocurrencia.
+  // Si esa ocurrencia ya tenía dinero de verdad descontado, se devuelve (como "Cancelar cargo") y
+  // se desmarca como pagada — queda pendiente en el día nuevo, sin volver a descontarse ella sola.
+  // Solo aplica a Suscripciones y Gastos fijos: las Deudas llevan un conteo secuencial de cuotas
+  // que no se puede "desmarcar" suelto sin desordenarlo (para eso ya está "Deshacer" en Deudas).
+  const onMoveOccurrence = (type, id, y, m, newDay) => {
+    if (type === 'debt') return;
+    const monthKey = `${y}-${String(m+1).padStart(2,'0')}`;
+    const sub = type==='sub' ? subscriptions.find(x=>x.id===id) : null;
+    const periodKey = (sub && sub.frequency==='annual') ? `${y}` : monthKey;
+    const appliedKey = `${type}:${id}:${periodKey}`;
+
+    const applied = (appliedPayments||[]).find(p => (typeof p==='string' ? p : p.key) === appliedKey);
+    if (applied && typeof applied !== 'string' && applied.amount > 0 && applied.accountId) {
+      applyBalanceDeltas([{ accountId: applied.accountId, delta: applied.amount }]);
+      setAppliedPayments(prev => (prev||[]).map(p => {
+        const pp = typeof p === 'string' ? { key:p, accountId:null, amount:0 } : p;
+        return pp.key===appliedKey ? {...pp, amount:0} : pp;
+      }));
+    }
+
+    const monthStart = new Date(y, m, 1);
+    const apply = (list, setList) => setList(list.map(item => item.id===id
+      ? { ...item,
+          paidMonths: (item.paidMonths||[]).filter(k=>k!==monthKey),
+          lastPaid: (item.lastPaid && isSameMonth(item.lastPaid, monthStart)) ? null : item.lastPaid,
+          dateOverrides: { ...(item.dateOverrides||{}), [monthKey]: newDay } }
+      : item));
+    if (type==='sub') apply(subscriptions, setSubscriptions);
+    else if (type==='fixed') apply(fixedExpenses, setFixedExpenses);
+  };
+
   /* ---------- cálculos derivados ---------- */
   const activeDebts = useMemo(()=> debts.filter(d=>!d.finished), [debts]);
   const finishedDebts = useMemo(()=> debts.filter(d=>d.finished), [debts]);
@@ -1883,11 +2043,11 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const totalDebtMonthly = useMemo(()=> activeDebts.filter(debtCountsThisMonth).reduce((a,d)=>a+d.monthlyPayment,0), [activeDebts]);
   const debtsNotStarted = useMemo(()=> activeDebts.filter(d=>!debtCountsThisMonth(d)), [activeDebts]);
   const totalDebtPending = useMemo(()=> installmentDebts.reduce((a,d)=>a+ (d.totalInstallments-effectivePaid(d))*d.monthlyPayment,0) + revolvingDebts.reduce((a,d)=>a+d.totalValue,0), [installmentDebts, revolvingDebts]);
-  const totalSubMonthly = useMemo(()=> activeSubs.reduce((a,s)=> a + (s.frequency==='annual' ? (s.annualPrice||0)/12 : (s.monthlyPrice||0)), 0), [activeSubs]);
-  const totalSubAnnual = useMemo(()=> activeSubs.reduce((a,s)=> a + (s.frequency==='annual' ? (s.annualPrice||0) : (s.monthlyPrice||0)*12), 0), [activeSubs]);
+  const totalSubMonthly = useMemo(()=> activeSubs.reduce((a,s)=> a + (s.frequency==='annual' ? effectiveSubValueNow(s)/12 : effectiveSubValueNow(s)), 0), [activeSubs]);
+  const totalSubAnnual = useMemo(()=> activeSubs.reduce((a,s)=> a + (s.frequency==='annual' ? effectiveSubValueNow(s) : effectiveSubValueNow(s)*12), 0), [activeSubs]);
   // totales "reales" (sin mezclar mensual/anual) — esto es lo que se muestra en Suscripciones Y en el Dashboard/Comprometido
-  const subsMonthlyReal = useMemo(()=> activeSubs.filter(s=>s.frequency!=='annual').reduce((a,s)=>a+(s.monthlyPrice||0),0), [activeSubs]);
-  const subsAnnualReal = useMemo(()=> activeSubs.filter(s=>s.frequency==='annual').reduce((a,s)=>a+(s.annualPrice||0),0), [activeSubs]);
+  const subsMonthlyReal = useMemo(()=> activeSubs.filter(s=>s.frequency!=='annual').reduce((a,s)=>a+effectiveSubValueNow(s),0), [activeSubs]);
+  const subsAnnualReal = useMemo(()=> activeSubs.filter(s=>s.frequency==='annual').reduce((a,s)=>a+effectiveSubValueNow(s),0), [activeSubs]);
   const totalFixedMonthly = useMemo(()=> {
     const withDay = fixedExpenses.filter(f=>f.paymentDay && fixedCountsThisMonth(f)).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0);
     const noDayPaid = fixedExpenses.filter(f=>!f.paymentDay && isPaidThisCycle(f)).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0);
@@ -1922,7 +2082,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         const y = Math.floor(idx/12), m = idx%12;
         if (isDebtPaidForOccurrence(d, y, m)) {
           out.push({ key:`debt:${d.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:d.accountId, amount:d.monthlyPayment,
-                     type:'debt', name:d.name, emoji:d.emoji, date:new Date(y, m, clampDay(d.paymentDay,y,m)) });
+                     type:'debt', name:d.name, emoji:d.emoji, date:new Date(y, m, clampDay(effectiveDay(d,y,m,d.paymentDay),y,m)) });
         }
       }
     });
@@ -1933,9 +2093,9 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       const startIdx = Math.min(start.getFullYear()*12 + start.getMonth(), curIdx);
       for (let idx = startIdx; idx <= curIdx; idx++) {
         const y = Math.floor(idx/12), m = idx%12;
-        const day = clampDay(s.billingDay, y, m);
+        const day = clampDay(effectiveDay(s,y,m,s.billingDay), y, m);
         if (isRecurringPaidForOccurrence(s, y, m, day)) {
-          out.push({ key:`sub:${s.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:s.accountId, amount:s.monthlyPrice,
+          out.push({ key:`sub:${s.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:s.accountId, amount:effectiveSubValue(s,y,m),
                      type:'sub', name:s.name, emoji:s.emoji, date:new Date(y, m, day) });
         }
       }
@@ -1949,7 +2109,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         const y = Math.floor(idx/12), m = idx%12;
         if (isFixedPaidForMonth(f, y, m)) {
           out.push({ key:`fixed:${f.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:f.accountId, amount:effectiveMonthlyValue(f,y,m),
-                     type:'fixed', name:f.name, emoji:f.emoji, date:new Date(y, m, clampDay(f.paymentDay,y,m)) });
+                     type:'fixed', name:f.name, emoji:f.emoji, date:new Date(y, m, clampDay(effectiveDay(f,y,m,f.paymentDay),y,m)) });
         }
       }
     });
@@ -2081,10 +2241,10 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const rows = [];
     activeDebts.forEach(d => { const {date,daysUntil} = nextDebtOccurrence(d); rows.push({ id:d.id, type:'debt', name:d.name, emoji:d.emoji, amount:d.monthlyPayment, date, daysUntil, mode:d.mode, paidThisCycle: d.noEndDate ? isPaidThisCycle(d) : false }); });
     activeSubs.forEach(s => {
-      const {date,daysUntil} = s.frequency==='annual' ? nextAnnualOccurrence(s.billingDate || todayISO()) : nextOccurrence(s.billingDay);
-      rows.push({ id:s.id, type:'sub', name:s.name, emoji:s.emoji, amount: s.frequency==='annual' ? s.annualPrice : s.monthlyPrice, date, daysUntil, mode:s.mode, paidThisCycle: isPaidThisCycle(s) });
+      const {date,daysUntil} = s.frequency==='annual' ? nextAnnualOccurrence(s.billingDate || todayISO()) : nextOccurrenceForItem(s, s.billingDay);
+      rows.push({ id:s.id, type:'sub', name:s.name, emoji:s.emoji, amount: effectiveSubValueNow(s), date, daysUntil, mode:s.mode, paidThisCycle: isPaidThisCycle(s) });
     });
-    fixedExpenses.forEach(f => { if (!f.paymentDay) return; const {date,daysUntil} = nextOccurrence(f.paymentDay); rows.push({ id:f.id, type:'fixed', name:f.name, emoji:f.emoji, amount:effectiveMonthlyValueNow(f), date, daysUntil, mode:f.mode, paidThisCycle: isPaidThisCycle(f) }); });
+    fixedExpenses.forEach(f => { if (!f.paymentDay) return; const {date,daysUntil} = nextOccurrenceForItem(f, f.paymentDay); rows.push({ id:f.id, type:'fixed', name:f.name, emoji:f.emoji, amount:effectiveMonthlyValueNow(f), date, daysUntil, mode:f.mode, paidThisCycle: isPaidThisCycle(f) }); });
     return rows.filter(r=>r.daysUntil<=14).sort((a,b)=>a.daysUntil-b.daysUntil);
   }, [activeDebts, activeSubs, fixedExpenses]);
 
@@ -2123,7 +2283,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const buildRows = () => {
     const rows = [];
     debts.forEach(d => rows.push({ tipo:'Deuda', nombre:d.name, valor_mensual:d.monthlyPayment, valor_total:d.totalValue, cuotas: d.noEndDate ? 'Sin fecha límite' : `${effectivePaid(d)}/${d.totalInstallments}`, estado: d.finished?'Finalizada':'Activa', dia_pago:d.paymentDay }));
-    subscriptions.forEach(s => rows.push({ tipo:'Suscripción', nombre:s.name, valor_mensual: s.frequency==='annual' ? (s.annualPrice||0)/12 : s.monthlyPrice, valor_total:s.frequency==='annual'?s.annualPrice:'', cuotas:'', estado:s.active?'Activa':'Cancelada', dia_pago:s.billingDay }));
+    subscriptions.forEach(s => rows.push({ tipo:'Suscripción', nombre:s.name, valor_mensual: s.frequency==='annual' ? effectiveSubValueNow(s)/12 : effectiveSubValueNow(s), valor_total:s.frequency==='annual'?effectiveSubValueNow(s):'', cuotas:'', estado:s.active?'Activa':'Cancelada', dia_pago:s.billingDay }));
     fixedExpenses.forEach(f => rows.push({ tipo:'Gasto fijo', nombre:f.name, valor_mensual:effectiveMonthlyValueNow(f), valor_total:'', cuotas:'', estado:'Activa', dia_pago:f.paymentDay }));
     return rows;
   };
@@ -2196,7 +2356,6 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
               <NavItem icon={<IArrowDown size={18}/>} label="Entradas" active={view==='income'} onClick={()=>setView('income')} collapsed={!sidebarOpen}/>
               <NavItem icon={<IDrop size={18}/>} label="Gastos hormiga" active={view==='ants'} onClick={()=>setView('ants')} collapsed={!sidebarOpen}/>
               <NavItem icon={<IPercent size={18}/>} label="Reparto de ingresos" active={view==='split'} onClick={()=>setView('split')} collapsed={!sidebarOpen}/>
-              <NavItem icon={<IWand size={18}/>} label="Simulador" active={view==='simulator'} onClick={()=>setView('simulator')} collapsed={!sidebarOpen}/>
               <NavItem icon={<IRepeat size={18}/>} label="Transferencias" active={view==='transfers'} onClick={()=>setView('transfers')} count={transfers.length} collapsed={!sidebarOpen}/>
               <NavItem icon={<ICalendar size={18}/>} label="Calendario" active={view==='calendar'} onClick={()=>setView('calendar')} collapsed={!sidebarOpen}/>
               <NavItem icon={<IChart size={18}/>} label="Estadísticas" active={view==='stats'} onClick={()=>setView('stats')} collapsed={!sidebarOpen}/>
@@ -2291,6 +2450,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                   exchangeRate={exchangeRate} onSetExchangeRate={setExchangeRate}
                   onAdd={()=>setModal({type:'account'})} onEdit={(a)=>setModal({type:'account', item:a})}
                   onDelete={(a)=>setConfirmDel({type:'account', id:a.id, name:a.name})}
+                  onAddPocket={(parentId)=>setModal({type:'account', defaultParentId:parentId})}
                   onOpen={(a)=>{setOpenAccountId(a.id); setView('accountDetail');}}
                   onToggleActive={toggleAccountActive} onToggleInNet={toggleAccountInNet}/>
               )}
@@ -2315,6 +2475,11 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                     onEditFixed={(f)=>setModal({type:'fixed', item:f})}
                     onDeleteFixed={(f)=>setConfirmDel({type:'fixed', id:f.id, name:f.name})}
                     onCancelCharge={(c)=>setConfirmDel({type:'appliedCharge', ...c})}
+                    onAddPocket={(parentId)=>setModal({type:'account', defaultParentId:parentId})}
+                    onQuickTransfer={(fromId, toId)=>setModal({type:'transfer', item:{fromAccountId:fromId, toAccountId:toId}})}
+                    onEditAccount={(a)=>setModal({type:'account', item:a})}
+                    onDeleteAccount={(a)=>setConfirmDel({type:'account', id:a.id, name:a.name})}
+                    onToggleAccountActive={toggleAccountActive}
                     onClose={()=>{setView('accounts'); setOpenAccountId(null);}}/>
                 );
               })()}
@@ -2368,11 +2533,9 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                   onAdd={()=>setModal({type:'splitRule'})} onEdit={(r)=>setModal({type:'splitRule', item:r})}
                   onDelete={(r)=>setConfirmDel({type:'splitRule', id:r.id, name:r.name})}
                   onAddExtraIncome={()=>setModal({type:'extraIncome'})} onEditExtraIncome={(e)=>setModal({type:'extraIncome', item:e})}
-                  onDeleteExtraIncome={(e)=>setConfirmDel({type:'extraIncome', id:e.id, name:`${e.name} (${fmt(e.amount)})`})}/>
-              )}
-              {view==='simulator' && (
-                <SimulatorView debts={activeDebts.filter(d=>!d.noEndDate)} incomeThisMonth={incomeThisMonth} totalCommitted={totalCommitted}
-                  antThisMonth={antThisMonth} netFlowThisMonth={netFlowThisMonth} liquidezTotal={liquidezTotal}/>
+                  onDeleteExtraIncome={(e)=>setConfirmDel({type:'extraIncome', id:e.id, name:`${e.name} (${fmt(e.amount)})`})}
+                  simDebts={activeDebts.filter(d=>!d.noEndDate)} incomeThisMonth={incomeThisMonth} totalCommitted={totalCommitted}
+                  antThisMonth={antThisMonth} netFlowThisMonth={netFlowThisMonth}/>
               )}
               {view==='transfers' && (
                 <TransfersView items={transfers} accounts={accounts}
@@ -2381,14 +2544,14 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
               )}
               {view==='calendar' && (
                 <CalendarView debts={activeDebts} subs={activeSubs} fixed={fixedExpenses}
-                  calMonth={calMonth} setCalMonth={setCalMonth} selectedDay={calSelectedDay} setSelectedDay={setCalSelectedDay}/>
+                  calMonth={calMonth} setCalMonth={setCalMonth} selectedDay={calSelectedDay} setSelectedDay={setCalSelectedDay} onMoveOccurrence={onMoveOccurrence}/>
               )}
               {view==='stats' && (
                 <StatsView distribution={distribution} projection={projection} totalCommitted={totalCommitted}
                   totalDebtMonthly={totalDebtMonthly} totalSubMonthly={subsMonthlyReal} totalFixedMonthly={totalFixedMonthly} history={monthlyHistory}/>
               )}
               {view==='history' && <HistoryView items={finishedDebts}/>}
-              {view==='account' && <AccountSettingsView userEmail={userEmail} onLogout={onLogout}/>}
+              {view==='account' && <AccountSettingsView userEmail={userEmail} onLogout={onLogout} onExportBackup={exportBackup}/>}
             </main>
           </div>
         </div>
@@ -2413,7 +2576,6 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                 {icon:<IArrowDown size={20}/>, label:'Entradas', view:'income'},
                 {icon:<IDrop size={20}/>, label:'Gastos hormiga', view:'ants'},
                 {icon:<IPercent size={20}/>, label:'Reparto', view:'split'},
-                {icon:<IWand size={20}/>, label:'Simulador', view:'simulator'},
                 {icon:<IRepeat size={20}/>, label:'Transferencias', view:'transfers'},
                 {icon:<IChart size={20}/>, label:'Estadísticas', view:'stats'},
                 {icon:<IArchive size={20}/>, label:'Historial', view:'history'},
@@ -2437,7 +2599,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         {modal?.type==='goal' && <Modal title={modal.item? 'Editar meta':'Nueva meta financiera'} onClose={()=>setModal(null)}><GoalForm initial={modal.item} netWorth={netWorth} onSave={upsertGoal} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='extraIncome' && <Modal title={modal.item? 'Editar ingreso':'Añadir ingreso de este mes'} onClose={()=>setModal(null)}><ExtraIncomeForm initial={modal.item} onSave={upsertExtraIncome} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='saving' && <Modal title={modal.item? 'Editar ahorro':'Nuevo ahorro'} onClose={()=>setModal(null)}><SavingsEntryForm initial={modal.item} projects={savingsProjects} accounts={accounts} onSave={upsertSaving} onClose={()=>setModal(null)}/></Modal>}
-        {modal?.type==='account' && <Modal title={modal.item? 'Editar cuenta':'Nueva cuenta'} onClose={()=>setModal(null)}><AccountForm initial={modal.item} onSave={upsertAccount} onClose={()=>setModal(null)}/></Modal>}
+        {modal?.type==='account' && <Modal title={modal.item? 'Editar cuenta':(modal.defaultParentId ? 'Nuevo pocket':'Nueva cuenta')} onClose={()=>setModal(null)}><AccountForm initial={modal.item} accounts={accounts} defaultParentId={modal.defaultParentId} onSave={upsertAccount} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='income' && <Modal title={modal.item? 'Editar entrada':'Nueva entrada'} onClose={()=>setModal(null)}><IncomeForm initial={modal.item} accounts={accounts} onSave={upsertIncome} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='ant' && <Modal title={modal.item? 'Editar gasto hormiga':'Nuevo gasto hormiga'} onClose={()=>setModal(null)}><AntExpenseForm initial={modal.item} accounts={accounts} onSave={upsertAnt} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='splitRule' && (() => {
@@ -2448,7 +2610,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
             </Modal>
           );
         })()}
-        {modal?.type==='transfer' && <Modal title={modal.item? 'Editar transferencia':'Nueva transferencia'} onClose={()=>setModal(null)}><TransferForm initial={modal.item} accounts={accounts} onSave={upsertTransfer} onClose={()=>setModal(null)}/></Modal>}
+        {modal?.type==='transfer' && <Modal title={modal.item?.id ? 'Editar transferencia':'Nueva transferencia'} onClose={()=>setModal(null)}><TransferForm initial={modal.item} accounts={accounts} onSave={upsertTransfer} onClose={()=>setModal(null)}/></Modal>}
         {confirmDel && <ConfirmDialog
           text={confirmDel.type==='saving'
             ? `Esto eliminará el aporte de ${confirmDel.name} y devolverá los saldos de las cuentas a como estaban antes de la transferencia.`
@@ -2462,7 +2624,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
 }
 
 function viewTitle(v) {
-  return { dashboard:'Dashboard', accounts:'Cuentas', debts:'Deudas', subs:'Suscripciones', fixed:'Gastos fijos', savings:'Ahorro', goals:'Metas', income:'Entradas', ants:'Gastos hormiga', split:'Reparto de ingresos', simulator:'Simulador', transfers:'Transferencias', calendar:'Calendario', stats:'Estadísticas', history:'Historial', account:'Usuario' }[v] || '';
+  return { dashboard:'Dashboard', accounts:'Cuentas', debts:'Deudas', subs:'Suscripciones', fixed:'Gastos fijos', savings:'Ahorro', goals:'Metas', income:'Entradas', ants:'Gastos hormiga', split:'Reparto de ingresos', transfers:'Transferencias', calendar:'Calendario', stats:'Estadísticas', history:'Historial', account:'Usuario' }[v] || '';
 }
 
 function NavItem({ icon, label, active, onClick, count, collapsed }) {
@@ -2734,31 +2896,26 @@ function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, on
 /* =========================================================================
    SUSCRIPCIONES
    ========================================================================= */
-function SubsView({ subs, accounts, onAdd, onEdit, onDelete, onToggle, onMarkPaid, onUndo, totalMonthly, totalAnnual }) {
-  const [q, setQ] = useState('');
-  const [filter, setFilter] = useState('todas');
-  const filtered = subs.filter(s => {
-    if (filter==='activas' && !s.active) return false;
-    if (filter==='canceladas' && s.active) return false;
-    return s.name.toLowerCase().includes(q.toLowerCase());
-  });
-  const monthlySubs = filtered.filter(s => s.frequency!=='annual')
-    .map(s => ({ ...s, _daysUntil: s.active ? nextOccurrence(s.billingDay).daysUntil : Infinity }))
-    .sort((a,b) => a._daysUntil - b._daysUntil);
-  const annualSubs = filtered.filter(s => s.frequency==='annual')
-    .map(s => ({ ...s, _daysUntil: s.active && s.billingDate ? nextAnnualOccurrence(s.billingDate).daysUntil : Infinity }))
-    .sort((a,b) => a._daysUntil - b._daysUntil);
+function SubCard({ s, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggle }) {
+  const daysUntil = s.active ? (s.frequency==='annual' ? (s.billingDate ? nextAnnualOccurrence(s.billingDate).daysUntil : null) : nextOccurrenceForItem(s, s.billingDay).daysUntil) : null;
+  const paid = s.active && isPaidThisCycle(s);
+  const nowS = new Date();
+  const overdue = s.active && s.mode!=='auto' && !paid && s.frequency!=='annual'
+    && startedByMonth(s.startDate, nowS.getFullYear(), nowS.getMonth())
+    && nowS.getDate() > clampDay(s.billingDay, nowS.getFullYear(), nowS.getMonth());
+  const paidToday = s.mode==='auto' ? (daysUntil===0 && paid) : (s.lastPaid===todayISO());
+  const displayAmount = effectiveSubValueNow(s);
 
-  const renderCard = (s) => {
-    const daysUntil = s.active ? (s.frequency==='annual' ? (s.billingDate ? nextAnnualOccurrence(s.billingDate).daysUntil : null) : nextOccurrence(s.billingDay).daysUntil) : null;
-    const paid = s.active && isPaidThisCycle(s);
-    const nowS = new Date();
-    const overdue = s.active && s.mode!=='auto' && !paid && s.frequency!=='annual'
-      && startedByMonth(s.startDate, nowS.getFullYear(), nowS.getMonth())
-      && nowS.getDate() > clampDay(s.billingDay, nowS.getFullYear(), nowS.getMonth());
-    const paidToday = s.mode==='auto' ? (daysUntil===0 && paid) : (s.lastPaid===todayISO());
-    return (
-      <div key={s.id} className={`bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex flex-col gap-3 animate-fadein ${!s.active && 'opacity-60'}`}>
+  const [editingAmount, setEditingAmount] = useState(false);
+  const [amountDraft, setAmountDraft] = useState(displayAmount || '');
+
+  const confirmPaid = () => {
+    onMarkPaid(s.id, Number(amountDraft) || 0);
+    setEditingAmount(false);
+  };
+
+  return (
+      <div className={`bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex flex-col gap-3 animate-fadein ${!s.active && 'opacity-60'}`}>
         <div className="flex items-start justify-between gap-2">
           <div className="flex items-center gap-3 min-w-0">
             <span className="text-2xl shrink-0">{s.emoji}</span>
@@ -2768,10 +2925,13 @@ function SubsView({ subs, accounts, onAdd, onEdit, onDelete, onToggle, onMarkPai
                 <span className="flex items-center gap-1 text-[10px] uppercase text-gray-500 border border-paper-300 dark:border-ink-500 rounded-full px-1.5 py-0.5 shrink-0">
                   {s.mode==='auto' ? <><IBolt size={10}/> Auto</> : <><IHand size={10}/> Manual</>}
                 </span>
+                {s.manualMonthlyValue && (
+                  <span className="text-[10px] uppercase text-gold-500 border border-gold-500/40 rounded-full px-1.5 py-0.5 shrink-0">Monto variable</span>
+                )}
                 <AccountBadge accountId={s.accountId} accounts={accounts}/>
               </div>
               <div className="text-gray-500 dark:text-gray-500">
-                {s.category} · {s.frequency==='annual' ? `Anual, ${s.billingDate ? new Date(s.billingDate).toLocaleDateString('es-ES',{day:'numeric',month:'short'}) : ''}` : `Mensual, ${nextOccurrence(s.billingDay).date.toLocaleDateString('es-ES',{day:'numeric',month:'short'})}`}
+                {s.category} · {s.frequency==='annual' ? `Anual, ${s.billingDate ? new Date(s.billingDate).toLocaleDateString('es-ES',{day:'numeric',month:'short'}) : ''}` : `Mensual, ${nextOccurrenceForItem(s, s.billingDay).date.toLocaleDateString('es-ES',{day:'numeric',month:'short'})}`}
               </div>
             </div>
           </div>
@@ -2781,7 +2941,8 @@ function SubsView({ subs, accounts, onAdd, onEdit, onDelete, onToggle, onMarkPai
           </div>
         </div>
         <div className="font-mono text-ink-900 dark:text-gray-100">
-          {s.frequency==='annual' ? <>{fmt(s.annualPrice)}<span className="text-gray-500 dark:text-gray-500">/año</span></> : <>{fmt(s.monthlyPrice)}<span className="text-gray-500 dark:text-gray-500">/mes</span></>}
+          {s.frequency==='annual' ? <>{fmt(displayAmount)}<span className="text-gray-500 dark:text-gray-500">/año</span></> : <>{fmt(displayAmount)}<span className="text-gray-500 dark:text-gray-500">/mes</span></>}
+          {s.manualMonthlyValue && <span className="text-xs text-gray-500 font-sans"> {paid ? 'este ciclo' : '(referencia)'}</span>}
         </div>
         {s.active && s.mode!=='auto' && (
           paid ? (
@@ -2789,6 +2950,18 @@ function SubsView({ subs, accounts, onAdd, onEdit, onDelete, onToggle, onMarkPai
               <span className="flex items-center gap-1.5 text-emerald-400 text-xs"><ICheck size={13}/> Pagado este ciclo</span>
               {paidToday && <button onClick={()=>onUndo(s.id)} className="px-3 py-1.5 rounded-lg text-xs text-gray-500 dark:text-gray-400 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Deshacer</button>}
             </div>
+          ) : s.manualMonthlyValue ? (
+            editingAmount ? (
+              <div className="flex items-center gap-2">
+                <input type="number" step="0.01" autoFocus className={inputCls+" max-w-[130px]"} value={amountDraft} onChange={e=>setAmountDraft(e.target.value)} onKeyDown={e=>e.key==='Enter' && confirmPaid()}/>
+                <button onClick={confirmPaid} className="flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition"><ICheck size={13}/> Confirmar</button>
+                <button onClick={()=>setEditingAmount(false)} className="px-3 py-1.5 rounded-lg text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600 text-xs transition">Cancelar</button>
+              </div>
+            ) : (
+              <button onClick={()=>{setAmountDraft(displayAmount||''); setEditingAmount(true);}} className="self-start flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition">
+                <ICheck size={13}/> Marcar como pagado
+              </button>
+            )
           ) : (
             <button onClick={()=>onMarkPaid(s.id)} className="flex items-center justify-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition">
               <ICheck size={13}/> Marcar como pagado
@@ -2808,8 +2981,25 @@ function SubsView({ subs, accounts, onAdd, onEdit, onDelete, onToggle, onMarkPai
         )}
         {daysUntil!==null && <DueCountdown daysUntil={daysUntil} paid={paid} paidToday={paidToday}/>}
       </div>
-    );
-  };
+  );
+}
+
+function SubsView({ subs, accounts, onAdd, onEdit, onDelete, onToggle, onMarkPaid, onUndo, totalMonthly, totalAnnual }) {
+  const [q, setQ] = useState('');
+  const [filter, setFilter] = useState('todas');
+  const filtered = subs.filter(s => {
+    if (filter==='activas' && !s.active) return false;
+    if (filter==='canceladas' && s.active) return false;
+    return s.name.toLowerCase().includes(q.toLowerCase());
+  });
+  const monthlySubs = filtered.filter(s => s.frequency!=='annual')
+    .map(s => ({ ...s, _daysUntil: s.active ? nextOccurrenceForItem(s, s.billingDay).daysUntil : Infinity }))
+    .sort((a,b) => a._daysUntil - b._daysUntil);
+  const annualSubs = filtered.filter(s => s.frequency==='annual')
+    .map(s => ({ ...s, _daysUntil: s.active && s.billingDate ? nextAnnualOccurrence(s.billingDate).daysUntil : Infinity }))
+    .sort((a,b) => a._daysUntil - b._daysUntil);
+
+  const renderCard = (s) => <SubCard key={s.id} s={s} accounts={accounts} onEdit={onEdit} onDelete={onDelete} onMarkPaid={onMarkPaid} onUndo={onUndo} onToggle={onToggle}/>;
 
   return (
     <div className="flex flex-col gap-5">
@@ -2852,8 +3042,8 @@ function SubsView({ subs, accounts, onAdd, onEdit, onDelete, onToggle, onMarkPai
    GASTOS FIJOS
    ========================================================================= */
 function FixedCard({ f, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggleMonth }) {
-  const daysUntil = f.paymentDay ? nextOccurrence(f.paymentDay).daysUntil : null;
-  const nextDate = f.paymentDay ? nextOccurrence(f.paymentDay).date : null;
+  const daysUntil = f.paymentDay ? nextOccurrenceForItem(f, f.paymentDay).daysUntil : null;
+  const nextDate = f.paymentDay ? nextOccurrenceForItem(f, f.paymentDay).date : null;
   const now = new Date();
   const paid = f.paymentDay ? isFixedPaidForMonth(f, now.getFullYear(), now.getMonth()) : isPaidThisCycle(f);
   // atrasado: el día de este mes ya pasó y nunca se marcó como pagado
@@ -2935,7 +3125,7 @@ function FixedCard({ f, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggle
 function FixedView({ items, accounts, onAdd, onEdit, onDelete, onMarkPaid, onUndo, onToggleMonth, totalMonthly, withDayCount, noDayCount, noDayTotal }) {
   const [q, setQ] = useState('');
   const filtered = items.filter(f=>f.name.toLowerCase().includes(q.toLowerCase()))
-    .map(f => ({ ...f, _daysUntil: f.paymentDay ? nextOccurrence(f.paymentDay).daysUntil : Infinity }))
+    .map(f => ({ ...f, _daysUntil: f.paymentDay ? nextOccurrenceForItem(f, f.paymentDay).daysUntil : Infinity }))
     .sort((a,b) => a._daysUntil - b._daysUntil);
   return (
     <div className="flex flex-col gap-5">
@@ -3379,9 +3569,11 @@ function MiniCollapsible({ title, count, children }) {
 
 function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antExpenses, transferList, duePayments, appliedPayments, debts, subs, fixed, projects, exchangeRate,
                          onEditSaving, onDeleteSaving, onEditIncome, onDeleteIncome, onEditAnt, onDeleteAnt, onEditTransfer, onDeleteTransfer, onEditDebt, onDeleteDebt,
-                         onEditSub, onDeleteSub, onEditFixed, onDeleteFixed, onCancelCharge, onClose }) {
+                         onEditSub, onDeleteSub, onEditFixed, onDeleteFixed, onCancelCharge, onAddPocket, onQuickTransfer, onEditAccount, onDeleteAccount, onToggleAccountActive, onClose }) {
   const id = account.id;
   const nameOf = (aid) => { const a = accounts.find(x=>x.id===aid); return a ? `${a.emoji} ${a.name}` : '—'; };
+  const myPockets = accounts.filter(a => a.parentAccountId === id);
+  const parentAccount = account.parentAccountId ? accounts.find(a=>a.id===account.parentAccountId) : null;
 
   // transferencias de ahorro que tocan esta cuenta
   const transfers = savingsEntries
@@ -3419,10 +3611,22 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
   const linkedSubs  = subs.filter(s=>s.accountId===id);
   const linkedFixed = fixed.filter(f=>f.accountId===id);
 
-  const monthlyOut =
-    linkedDebts.reduce((s,d)=>s+(d.monthlyPayment||0),0) +
-    linkedSubs.filter(s=>s.active && s.frequency!=='annual').reduce((s,x)=>s+(x.monthlyPrice||0),0) +
-    linkedFixed.reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
+  const nowMO = new Date();
+  const debtsCountedItems = linkedDebts.filter(debtCountsThisMonth);
+  const subsCountedItems = linkedSubs.filter(s=>s.active && s.frequency!=='annual');
+  const fixedCountedItems = linkedFixed.filter(f=>f.paymentDay ? fixedCountsThisMonth(f) : isPaidThisCycle(f));
+  const antsThisMonthList = ants.filter(e=>isSameMonth(e.date, nowMO));
+  const debtsPart = debtsCountedItems.reduce((s,d)=>s+(d.monthlyPayment||0),0);
+  const subsPart = subsCountedItems.reduce((s,x)=>s+effectiveSubValueNow(x),0);
+  const fixedPart = fixedCountedItems.reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
+  const antsPart = antsThisMonthList.reduce((s,e)=>s+e.amount,0);
+  const monthlyOut = debtsPart + subsPart + fixedPart + antsPart;
+  const monthlyOutParts = [
+    debtsPart>0 && { label:`${fmt(debtsPart)} deuda${debtsCountedItems.length===1?'':'s'}` },
+    subsPart>0 && { label:`${fmt(subsPart)} suscripci${subsCountedItems.length===1?'ón':'ones'}` },
+    fixedPart>0 && { label:`${fmt(fixedPart)} gasto${fixedCountedItems.length===1?' fijo':'s fijos'}` },
+    antsPart>0 && { label:`${fmt(antsPart)} hormiga (${antsThisMonthList.length})` },
+  ].filter(Boolean);
 
   const Row = ({ emoji, title, subtitle, amount, positive, onEdit, onDelete }) => (
     <div className="flex items-center gap-3 py-2.5 border-t border-paper-300/60 dark:border-ink-500/40">
@@ -3472,14 +3676,52 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
           <div className="text-xs uppercase tracking-wider text-gray-500">Saldo actual</div>
           <div className={`font-mono text-xl font-semibold ${account.balance<0 ? 'text-red-400':'text-ink-900 dark:text-gray-100'}`}>{fmtCur(account.balance, account.currency)}</div>
           {account.currency==='USD' && <div className="text-xs text-gray-500 mt-0.5">≈ {fmt(accountBalanceInEur(account, exchangeRate))}</div>}
+          {parentAccount && <div className="text-xs text-gold-500 mt-1">Pocket de {parentAccount.emoji} {parentAccount.name}</div>}
         </div>
         {monthlyOut > 0 && (
-          <div className="text-right">
+          <div className="text-right max-w-[220px]">
             <div className="text-xs uppercase tracking-wider text-gray-500">Sale cada mes</div>
             <div className="font-mono text-lg text-red-400">−{fmt(monthlyOut)}</div>
+            {monthlyOutParts.length>1 && (
+              <div className="text-[11px] text-gray-500 mt-0.5 leading-snug">
+                {monthlyOutParts.map(p=>p.label).join(' + ')}
+              </div>
+            )}
           </div>
         )}
       </div>
+
+      {!account.parentAccountId && (
+        <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-4 shadow-soft flex flex-col gap-3">
+          <div className="flex items-center justify-between">
+            <span className="uppercase tracking-wider text-gray-500 dark:text-gray-400 font-medium text-xs">Pockets</span>
+            <button onClick={()=>onAddPocket(id)} className="text-xs text-gold-500 hover:underline flex items-center gap-1"><IPlus size={12}/> Crear pocket</button>
+          </div>
+          {myPockets.length===0 ? (
+            <p className="text-xs text-gray-500">Aún no tienes pockets aquí — son sub-cuentas con su propio saldo, separado del de {account.name}.</p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {myPockets.map(p => (
+                <div key={p.id} className="flex items-center justify-between gap-2 text-sm py-2 border-t border-paper-300/60 dark:border-ink-500/40">
+                  <span className="flex items-center gap-2 min-w-0">
+                    <span>{p.emoji}</span>
+                    <span className="truncate">{p.name}</span>
+                    {!p.active && <span className="text-[10px] uppercase text-gray-500 border border-paper-300 dark:border-ink-500 rounded-full px-1.5 py-0.5 shrink-0">Inactivo</span>}
+                  </span>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <span className={`font-mono ${p.balance<0?'text-red-400':'text-ink-900 dark:text-gray-100'}`}>{fmtCur(p.balance, p.currency)}</span>
+                    <button onClick={()=>onQuickTransfer(id, p.id)} title={`Mover de ${account.name} a ${p.name}`} className="p-1.5 text-gray-500 hover:text-gold-500 transition"><IArrowRight size={15}/></button>
+                    <button onClick={()=>onQuickTransfer(p.id, id)} title={`Mover de ${p.name} a ${account.name}`} className="p-1.5 text-gray-500 hover:text-gold-500 transition"><IArrowLeft size={15}/></button>
+                    <button onClick={()=>onToggleAccountActive(p.id)} title={p.active ? 'Desactivar' : 'Activar'} className={`p-1.5 transition ${p.active ? 'text-emerald-400' : 'text-gray-400'}`}><ICheck size={15}/></button>
+                    <button onClick={()=>onEditAccount(p)} className="p-1.5 text-gray-500 hover:text-ink-900 dark:hover:text-gray-200 transition"><IEdit size={15}/></button>
+                    <button onClick={()=>onDeleteAccount(p)} className="p-1.5 text-gray-500 hover:text-red-400 transition"><ITrash size={15}/></button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {hasNothing && <p className="text-sm text-gray-500 py-4 text-center">Esta cuenta todavía no tiene movimientos ni pagos vinculados.</p>}
 
@@ -3576,7 +3818,7 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
           {linkedSubs.map(s => (
             <Row key={s.id} emoji={s.emoji} title={s.name}
               subtitle={`${s.frequency==='annual' ? 'Anual' : `Mensual, día ${s.billingDay}`}${!s.active ? ' · Cancelada' : ''}`}
-              amount={s.frequency==='annual' ? s.annualPrice : s.monthlyPrice} positive={false}
+              amount={effectiveSubValueNow(s)} positive={false}
               onEdit={()=>onEditSub(s)} onDelete={()=>onDeleteSub(s)}/>
           ))}
         </MiniCollapsible>
@@ -3600,18 +3842,21 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
   );
 }
 
-function AccountsView({ accounts, netWorth, accountsInNet, onAdd, onEdit, onDelete, onToggleActive, onToggleInNet, onOpen, debts, subs, fixed, exchangeRate, onSetExchangeRate }) {
-  const active = accounts.filter(a=>a.active);
-  const inactive = accounts.filter(a=>!a.active);
+function AccountsView({ accounts, netWorth, accountsInNet, onAdd, onEdit, onDelete, onToggleActive, onToggleInNet, onOpen, onAddPocket, debts, subs, fixed, exchangeRate, onSetExchangeRate }) {
+  // los pockets NO se muestran aquí sueltos — solo dentro del detalle de su cuenta madre
+  const active = accounts.filter(a=>a.active && !a.parentAccountId);
+  const inactive = accounts.filter(a=>!a.active && !a.parentAccountId);
   const positives = accounts.filter(a=>a.active && a.includeInNet && a.balance>0).reduce((s,a)=>s+accountBalanceInEur(a, exchangeRate),0);
   const negatives = accounts.filter(a=>a.active && a.includeInNet && a.balance<0).reduce((s,a)=>s+accountBalanceInEur(a, exchangeRate),0);
   const hasUsd = accounts.some(a=>a.currency==='USD');
   const [editingRate, setEditingRate] = useState(false);
   const [rateDraft, setRateDraft] = useState(exchangeRate);
   const saveRate = () => { onSetExchangeRate(Number(rateDraft) || 0.92); setEditingRate(false); };
+  const accountName = (id) => { const a = accounts.find(x=>x.id===id); return a ? `${a.emoji} ${a.name}` : ''; };
+  const pocketsOf = (id) => accounts.filter(a=>a.parentAccountId===id);
 
   const Card = ({ a }) => (
-    <div className={`bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex flex-col gap-3 animate-fadein ${!a.active && 'opacity-70'}`}>
+    <div className={`bg-white dark:bg-ink-700 border ${a.parentAccountId ? 'border-dashed border-paper-300 dark:border-ink-500/50 ml-4' : 'border-paper-300 dark:border-ink-500/70'} rounded-2xl p-5 shadow-soft flex flex-col gap-3 animate-fadein ${!a.active && 'opacity-70'}`}>
       <div className="flex items-start justify-between gap-2">
         <button onClick={()=>onOpen(a)} className="flex items-center gap-3 min-w-0 text-left group">
           <span className="text-2xl shrink-0">{a.emoji}</span>
@@ -3619,6 +3864,7 @@ function AccountsView({ accounts, netWorth, accountsInNet, onAdd, onEdit, onDele
             <div className="font-medium text-ink-900 dark:text-gray-100 truncate group-hover:text-gold-500 transition flex items-center gap-1.5">
               {a.name}
               {a.currency==='USD' && <span className="text-[10px] uppercase text-gray-500 border border-paper-300 dark:border-ink-500 rounded-full px-1.5 py-0.5 shrink-0">USD</span>}
+              {a.parentAccountId && <span className="text-[10px] uppercase text-gold-500 border border-gold-500/40 rounded-full px-1.5 py-0.5 shrink-0">Pocket de {accountName(a.parentAccountId)}</span>}
             </div>
             {a.note && <div className="text-gray-500 dark:text-gray-500 text-xs truncate">{a.note}</div>}
           </div>
@@ -3651,6 +3897,12 @@ function AccountsView({ accounts, netWorth, accountsInNet, onAdd, onEdit, onDele
           <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${a.active?'left-4':'left-0.5'}`}/>
         </span>
       </button>
+
+      {!a.parentAccountId && (
+        <button onClick={()=>onAddPocket(a.id)} className="text-xs text-gold-500 hover:underline text-left flex items-center gap-1">
+          <IPlus size={12}/> {pocketsOf(a.id).length>0 ? 'Añadir otro pocket' : 'Crear un pocket dentro de esta cuenta'}
+        </button>
+      )}
     </div>
   );
 
@@ -4099,7 +4351,7 @@ function ToggleRow({ emoji, name, amount, active, onToggle }) {
 function RuleCard({ r, totalIncome, accountName, debts, subs, fixed, antBudget, savingsBudget, expanded, onToggleExpand, onEdit, onDelete, onToggleLinkedItem }) {
   const linked = r.linkedItems || [];
   const isLinked = (type, id) => linked.some(li => li.type===type && (id===undefined ? true : li.id===id));
-  const monthlySub = (s) => s.frequency==='annual' ? (s.annualPrice||0)/12 : (s.monthlyPrice||0);
+  const monthlySub = (s) => s.frequency==='annual' ? effectiveSubValueNow(s)/12 : effectiveSubValueNow(s);
 
   const linkedSum = useMemo(() => linked.reduce((sum, li) => {
     if (li.type==='ants') return sum + (antBudget||0);
@@ -4162,7 +4414,8 @@ function RuleCard({ r, totalIncome, accountName, debts, subs, fixed, antBudget, 
 }
 
 function SplitView({ rules, accounts, incomeAuto, salaryOverride, salaryForSplit, onSetSalaryOverride, onClearSalaryOverride, extraIncome, extraIncomeTotal, liquidezTotal, gastosMensuales,
-                     debts, subs, fixed, antBudget, savingsBudget, onToggleLinkedItem, onAdd, onEdit, onDelete, onAddExtraIncome, onEditExtraIncome, onDeleteExtraIncome }) {
+                     debts, subs, fixed, antBudget, savingsBudget, onToggleLinkedItem, onAdd, onEdit, onDelete, onAddExtraIncome, onEditExtraIncome, onDeleteExtraIncome,
+                     simDebts, incomeThisMonth, totalCommitted, antThisMonth, netFlowThisMonth }) {
   const [expandedRuleId, setExpandedRuleId] = useState(null);
   const [editingSalary, setEditingSalary] = useState(false);
   const [salaryDraft, setSalaryDraft] = useState(salaryForSplit);
@@ -4291,6 +4544,16 @@ function SplitView({ rules, accounts, incomeAuto, salaryOverride, salaryForSplit
           </div>
         </div>
       )}
+
+      <div className="border-t border-paper-300 dark:border-ink-500/50 pt-5 mt-2 flex flex-col gap-5">
+        <h3 className="font-medium text-ink-900 dark:text-gray-100 flex items-center gap-2"><IWand size={17}/> Simulador "qué pasaría si"</h3>
+        <p className="text-sm text-gray-500 -mt-2">Prueba escenarios sin riesgo — nada de esto se guarda ni toca tus datos reales, es solo para ver el efecto antes de decidir.</p>
+        {simDebts.length>0
+          ? <DebtPayoffCard debts={simDebts}/>
+          : <SimCard title="Pagar extra a una deuda" icon={<ICard size={18} className="text-red-400"/>}><p className="text-xs text-gray-500">No tienes deudas con número fijo de cuotas para simular.</p></SimCard>}
+        <IncomeChangeCard incomeThisMonth={incomeThisMonth} totalCommitted={totalCommitted} antThisMonth={antThisMonth}/>
+        <NewExpenseCard totalCommitted={totalCommitted} incomeThisMonth={incomeThisMonth} antThisMonth={antThisMonth} liquidezTotal={liquidezTotal}/>
+      </div>
     </div>
   );
 }
@@ -4298,7 +4561,7 @@ function SplitView({ rules, accounts, incomeAuto, salaryOverride, salaryForSplit
 /* =========================================================================
    CALENDARIO
    ========================================================================= */
-function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, setSelectedDay }) {
+function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, setSelectedDay, onMoveOccurrence }) {
   const { y, m } = calMonth;
   const totalDays = daysInMonth(y,m);
   const firstWeekday = (new Date(y,m,1).getDay()+6)%7; // lunes=0
@@ -4315,9 +4578,9 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
       // si la deuda tiene un número fijo de cuotas (no es "sin fecha límite"), deja de aparecer
       // en el calendario en cuanto el mes cae fuera de esas cuotas — si no, se repite para siempre.
       const withinSchedule = d.noEndDate || !d.totalInstallments || (monthIndex - firstIndex) < d.totalInstallments;
-      if (monthIndex >= firstIndex && withinSchedule && clampDay(d.paymentDay,y,m)===day) {
+      if (monthIndex >= firstIndex && withinSchedule && clampDay(effectiveDay(d,y,m,d.paymentDay),y,m)===day) {
         const paid = isDebtPaidForOccurrence(d, y, m);
-        list.push({type:'debt', name:d.name, emoji:d.emoji, amount:d.monthlyPayment, paid, overdue: isPast && !paid});
+        list.push({type:'debt', id:d.id, name:d.name, emoji:d.emoji, amount:d.monthlyPayment, paid, overdue: isPast && !paid});
       }
     });
     subs.forEach(s => {
@@ -4326,25 +4589,25 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
         const anchor = new Date(s.billingDate);
         // antes solo comparaba mes y día, así que aparecía en CUALQUIER año — incluso años antes
         // de su primer cobro real. Ahora exige también que el año no sea anterior al de billingDate.
-        if (y >= anchor.getFullYear() && anchor.getMonth()===m && clampDay(anchor.getDate(),y,m)===day) {
+        if (y >= anchor.getFullYear() && anchor.getMonth()===m && clampDay(effectiveDay(s,y,m,anchor.getDate()),y,m)===day) {
           const paid = isRecurringPaidForOccurrence(s, y, m, day);
-          list.push({type:'sub', name:s.name, emoji:s.emoji, amount:s.annualPrice, paid, overdue: isPast && !paid});
+          list.push({type:'sub', id:s.id, name:s.name, emoji:s.emoji, amount:effectiveSubValue(s,y,m), paid, overdue: isPast && !paid});
         }
-      } else if (startedByMonth(s.startDate, y, m) && clampDay(s.billingDay,y,m)===day) {
+      } else if (startedByMonth(s.startDate, y, m) && clampDay(effectiveDay(s,y,m,s.billingDay),y,m)===day) {
         const paid = isRecurringPaidForOccurrence(s, y, m, day);
-        list.push({type:'sub', name:s.name, emoji:s.emoji, amount:s.monthlyPrice, paid, overdue: isPast && !paid});
+        list.push({type:'sub', id:s.id, name:s.name, emoji:s.emoji, amount:effectiveSubValue(s,y,m), paid, overdue: isPast && !paid});
       }
     });
     fixed.forEach(f => {
-      if (f.paymentDay && startedByMonth(f.startDate, y, m) && clampDay(f.paymentDay,y,m)===day) {
+      if (f.paymentDay && startedByMonth(f.startDate, y, m) && clampDay(effectiveDay(f,y,m,f.paymentDay),y,m)===day) {
         const paid = isFixedPaidForMonth(f, y, m);
-        list.push({type:'fixed', name:f.name, emoji:f.emoji, amount:effectiveMonthlyValue(f,y,m), paid, overdue: isPast && !paid});
+        list.push({type:'fixed', id:f.id, name:f.name, emoji:f.emoji, amount:effectiveMonthlyValue(f,y,m), paid, overdue: isPast && !paid});
       } else if (!f.paymentDay && f.lastPaid) {
         // sin día fijo no hay una fecha programada de la que colgarse, así que lo mostramos
         // en el día real en que lo marcaste pagado (nunca como "atrasado", porque no tiene fecha límite)
         const lp = new Date(f.lastPaid);
         if (lp.getFullYear()===y && lp.getMonth()===m && lp.getDate()===day) {
-          list.push({type:'fixed', name:f.name, emoji:f.emoji, amount:effectiveMonthlyValue(f,y,m), paid:true, overdue:false});
+          list.push({type:'fixed', id:f.id, name:f.name, emoji:f.emoji, amount:effectiveMonthlyValue(f,y,m), paid:true, overdue:false});
         }
       }
     });
@@ -4362,6 +4625,18 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
   const today = new Date();
   const isCurrentMonth = y===today.getFullYear() && m===today.getMonth();
   const goToToday = () => { setCalMonth({y:today.getFullYear(), m:today.getMonth()}); setSelectedDay(today.getDate()); };
+  const [dragOverDay, setDragOverDay] = useState(null);
+  const handleDragStart = (e, it) => {
+    e.dataTransfer.setData('application/json', JSON.stringify({ type: it.type, id: it.id }));
+  };
+  const handleDrop = (e, targetDay) => {
+    e.preventDefault();
+    setDragOverDay(null);
+    try {
+      const { type, id } = JSON.parse(e.dataTransfer.getData('application/json'));
+      if (targetDay !== selectedDay) onMoveOccurrence(type, id, y, m, targetDay);
+    } catch {}
+  };
 
   return (
     <div className="flex flex-col gap-5">
@@ -4394,8 +4669,11 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
           const isToday = new Date().toDateString() === new Date(y,m,day).toDateString();
           return (
             <button key={i} onClick={()=>setSelectedDay(day)}
+              onDragOver={(e)=>{e.preventDefault(); setDragOverDay(day);}}
+              onDragLeave={()=>setDragOverDay(d=>d===day?null:d)}
+              onDrop={(e)=>handleDrop(e, day)}
               className={`min-h-[72px] rounded-xl border p-1.5 flex flex-col items-start gap-0.5 transition-all text-left
-              ${hasOverdue ? 'bg-orange-500/15 border-orange-500/50' : selectedDay===day ? 'border-gold-500 bg-gold-500/10' : 'border-paper-300 dark:border-ink-500/60 hover:border-paper-300 dark:hover:border-ink-400'} ${isToday?'ring-1 ring-gold-500/60':''}`}>
+              ${dragOverDay===day ? 'border-gold-500 bg-gold-500/20 border-2' : hasOverdue ? 'bg-orange-500/15 border-orange-500/50' : selectedDay===day ? 'border-gold-500 bg-gold-500/10' : 'border-paper-300 dark:border-ink-500/60 hover:border-paper-300 dark:hover:border-ink-400'} ${isToday?'ring-1 ring-gold-500/60':''}`}>
               <span className="font-mono text-gray-500 dark:text-gray-400">{day}</span>
               <div className="flex flex-col gap-0.5 w-full">
                 {list.slice(0,3).map((it,j)=>(
@@ -4410,8 +4688,11 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
       {selectedDay && (
         <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft animate-fadein">
           <div className="font-medium text-ink-900 dark:text-gray-100 mb-3">Pagos el día {selectedDay}</div>
+          <p className="text-xs text-gray-500 -mt-2 mb-3">Arrastra una suscripción o gasto fijo a otro día de este mismo mes para corregir cuándo se pagó de verdad. Las deudas no se pueden arrastrar.</p>
           {dayList.length ? dayList.map((it,i)=>(
-            <div key={i} className="flex items-center gap-3 py-2 border-paper-300/80 dark:border-ink-500/40 first:border-t-0 text-sm">
+            <div key={i} draggable={it.type!=='debt'} onDragStart={(e)=> it.type!=='debt' && handleDragStart(e, it)}
+              className={`flex items-center gap-3 py-2 border-paper-300/80 dark:border-ink-500/40 first:border-t-0 text-sm rounded-lg px-1 -mx-1 transition ${it.type!=='debt' ? 'cursor-grab active:cursor-grabbing hover:bg-paper-200/60 dark:hover:bg-ink-600/40' : ''}`}>
+              {it.type!=='debt' && <IMore size={14} className="text-gray-400 shrink-0"/>}
               <span className="text-lg">{it.emoji}</span>
               <span className="flex-1">{it.name}</span>
               {it.overdue && <span className="text-xs px-2 py-0.5 rounded-full bg-orange-500/15 text-orange-500">Atrasado</span>}
@@ -4552,7 +4833,7 @@ function HistoryView({ items }) {
 /* =========================================================================
    USUARIO (correo, contraseña, sesión)
    ========================================================================= */
-function AccountSettingsView({ userEmail, onLogout }) {
+function AccountSettingsView({ userEmail, onLogout, onExportBackup }) {
   const [newEmail, setNewEmail] = useState('');
   const [emailPassword, setEmailPassword] = useState('');
   const [emailBusy, setEmailBusy] = useState(false);
@@ -4651,6 +4932,14 @@ function AccountSettingsView({ userEmail, onLogout }) {
             {passBusy ? 'Un momento…' : 'Guardar contraseña nueva'}
           </button>
         </form>
+      </div>
+
+      <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h3 className="font-medium text-ink-900 dark:text-gray-100">Copia de seguridad</h3>
+          <p className="text-xs text-gray-500 mt-0.5">Descarga un archivo con todos tus datos tal como están ahora. Guárdalo en tu computadora — no depende de la app ni de Firebase.</p>
+        </div>
+        <button onClick={onExportBackup} className="px-4 py-2 rounded-lg bg-gold-500 hover:bg-gold-600 text-ink-900 text-sm font-medium transition flex items-center gap-1.5"><IDownload size={15}/> Descargar copia</button>
       </div>
 
       <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex items-center justify-between flex-wrap gap-3">
