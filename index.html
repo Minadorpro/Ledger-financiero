@@ -2139,7 +2139,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const loose = savingsEntries.filter(e=>!e.toAccountId).reduce((a,e)=>a+e.amount,0);
     return inAccounts + loose;
   }, [savingsEntries, savingsProjects, accounts, exchangeRate]);
-  const savedThisMonth = useMemo(()=> savingsEntries.filter(e=>isSameMonth(e.date, now)).reduce((a,e)=>a+e.amount,0), [savingsEntries]);
+  const savedThisMonth = useMemo(()=> savingsEntries.filter(e=>isSameMonth(e.date, new Date())).reduce((a,e)=>a+e.amount,0), [savingsEntries]);
   // valor neto: solo las cuentas que el usuario marcó para incluir
   /* ---------- motor: descontar de las cuentas los pagos ya pagados ---------- */
   // devuelve la lista de "pagos vigentes": cada ocurrencia pagada de algo vinculado a una cuenta
