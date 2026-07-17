@@ -1579,6 +1579,8 @@ function ExtraIncomeForm({ initial, onSave, onClose }) {
 function App({ userId, userEmail, isAdmin, onLogout }) {
   const isOwner = isAdmin; // solo el dueño recibe la migración de cuentas iniciales
   const [loaded, setLoaded] = useState(false);
+  const [notifsEnabled, setNotifsEnabled] = useState(() => localStorage.getItem('ledger_notifs') === 'on');
+  const [notifPermission, setNotifPermission] = useState(() => (typeof Notification!=='undefined' ? Notification.permission : 'unsupported'));
   const [theme, setTheme] = useState('dark');
   const [debts, setDebts] = useState([]);
   const [subscriptions, setSubscriptions] = useState([]);
@@ -2035,6 +2037,49 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
 
   /* ---------- cálculos derivados ---------- */
   const activeDebts = useMemo(()=> debts.filter(d=>!d.finished), [debts]);
+
+  // notificaciones locales: pide permiso al navegador y avisa (una vez al día) de lo que vence mañana.
+  // Solo funciona mientras tengas la app abierta o recién cerrada — no es un push real desde un
+  // servidor, así que no llega si el navegador lleva mucho tiempo sin abrirse.
+  const enableNotifications = async () => {
+    if (typeof Notification === 'undefined') return;
+    const perm = await Notification.requestPermission();
+    setNotifPermission(perm);
+    if (perm === 'granted') { localStorage.setItem('ledger_notifs', 'on'); setNotifsEnabled(true); }
+  };
+  const disableNotifications = () => { localStorage.setItem('ledger_notifs', 'off'); setNotifsEnabled(false); };
+
+  useEffect(() => {
+    if (!loaded || !notifsEnabled || notifPermission !== 'granted' || !('serviceWorker' in navigator)) return;
+    const todayKey = todayISO();
+    if (localStorage.getItem('ledger_notifs_last_check') === todayKey) return;
+
+    const dueTomorrow = [];
+    activeDebts.forEach(d => {
+      const occ = nextDebtOccurrence(d);
+      if (occ.daysUntil === 1) dueTomorrow.push(`💳 ${d.name} · ${fmt(d.monthlyPayment)}`);
+    });
+    subscriptions.filter(s=>s.active).forEach(s => {
+      const occ = s.frequency==='annual' ? (s.billingDate ? nextAnnualOccurrence(s.billingDate) : null) : nextOccurrenceForItem(s, s.billingDay);
+      if (occ && occ.daysUntil === 1) dueTomorrow.push(`🔁 ${s.name} · ${fmt(effectiveSubValueNow(s))}`);
+    });
+    fixedExpenses.filter(f=>f.paymentDay).forEach(f => {
+      const occ = nextOccurrenceForItem(f, f.paymentDay);
+      if (occ.daysUntil === 1) dueTomorrow.push(`🧾 ${f.name} · ${fmt(effectiveMonthlyValueNow(f))}`);
+    });
+
+    if (dueTomorrow.length > 0) {
+      navigator.serviceWorker.ready.then(reg => {
+        reg.showNotification(dueTomorrow.length===1 ? 'Mañana vence un pago' : `Mañana vencen ${dueTomorrow.length} pagos`, {
+          body: dueTomorrow.join('\n'),
+          icon: 'icon-192.png',
+          badge: 'icon-192.png',
+          tag: 'ledger-due-tomorrow',
+        });
+      }).catch(()=>{});
+    }
+    localStorage.setItem('ledger_notifs_last_check', todayKey);
+  }, [loaded, notifsEnabled, notifPermission, activeDebts, subscriptions, fixedExpenses]);
   const finishedDebts = useMemo(()=> debts.filter(d=>d.finished), [debts]);
   const activeSubs = useMemo(()=> subscriptions.filter(s=>s.active), [subscriptions]);
   const installmentDebts = useMemo(()=> activeDebts.filter(d=>!d.noEndDate), [activeDebts]);
@@ -2057,6 +2102,15 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const fixedNoDayCount = useMemo(()=> fixedExpenses.filter(f=>!f.paymentDay && !isPaidThisCycle(f)).length, [fixedExpenses]);
   const fixedNoDayTotal = useMemo(()=> fixedExpenses.filter(f=>!f.paymentDay && !isPaidThisCycle(f)).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0), [fixedExpenses]);
   const totalCommitted = totalDebtMonthly + subsMonthlyReal + totalFixedMonthly;
+  // de lo comprometido este mes, cuánto todavía no se ha pagado/descontado
+  // (los gastos fijos sin día no entran aquí: si cuentan en el total, es justo porque YA se pagaron)
+  const pendingThisMonth = useMemo(() => {
+    const now = new Date(); const y = now.getFullYear(), m = now.getMonth();
+    const debtsPending = activeDebts.filter(debtCountsThisMonth).filter(d=>!isDebtPaidForOccurrence(d,y,m)).reduce((a,d)=>a+d.monthlyPayment,0);
+    const subsPending = activeSubs.filter(s=>s.frequency!=='annual').filter(s=>!isPaidThisCycle(s)).reduce((a,s)=>a+effectiveSubValueNow(s),0);
+    const fixedPending = fixedExpenses.filter(f=>f.paymentDay && fixedCountsThisMonth(f)).filter(f=>!isFixedPaidForMonth(f,y,m)).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0);
+    return debtsPending + subsPending + fixedPending;
+  }, [activeDebts, activeSubs, fixedExpenses]);
   // total ahorrado = saldo de las cuentas vinculadas a proyectos + aportes que no fueron a ninguna cuenta
   // (así no contamos dos veces: el dinero que está en una cuenta se cuenta por el saldo, no por el aporte)
   const totalSaved = useMemo(()=> {
@@ -2551,7 +2605,8 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                   totalDebtMonthly={totalDebtMonthly} totalSubMonthly={subsMonthlyReal} totalFixedMonthly={totalFixedMonthly} history={monthlyHistory}/>
               )}
               {view==='history' && <HistoryView items={finishedDebts}/>}
-              {view==='account' && <AccountSettingsView userEmail={userEmail} onLogout={onLogout} onExportBackup={exportBackup}/>}
+              {view==='account' && <AccountSettingsView userEmail={userEmail} onLogout={onLogout} onExportBackup={exportBackup}
+                notifsEnabled={notifsEnabled} notifPermission={notifPermission} onEnableNotifications={enableNotifications} onDisableNotifications={disableNotifications}/>}
             </main>
           </div>
         </div>
@@ -2690,12 +2745,13 @@ function Dashboard({ totalCommitted, totalDebtMonthly, totalDebtPending, totalSu
         <KpiCard label="Ahorrado" value={fmt(totalSaved)} sub="Total en tus proyectos" accent="#3DDC97" icon={<IPiggy size={16}/>}/>
       </div>
 
-      <div className={`grid grid-cols-1 ${hasAccounts ? 'sm:grid-cols-2' : ''} gap-4`}>
+      <div className={`grid grid-cols-1 ${hasAccounts ? 'sm:grid-cols-3' : 'sm:grid-cols-2'} gap-4`}>
         {hasAccounts && (
           <KpiCard label="Valor neto" value={fmt(netWorth)} sub="Saldo de tus cuentas"
             accent={netWorth >= 0 ? '#3DDC97' : COLORS.debt} icon={<IBank size={16}/>}/>
         )}
         <KpiCard label="Comprometido / mes" value={fmt(totalCommitted)} sub="Deudas + suscripciones + fijos" accent={COLORS.gold} icon={<IWallet size={16}/>}/>
+        <KpiCard label="Falta por pagar" value={fmt(pendingThisMonth)} sub={pendingThisMonth>0 ? "De lo comprometido, aún sin descontar" : "Ya se descontó todo este mes"} accent={pendingThisMonth>0 ? COLORS.debt : '#3DDC97'} icon={<IBell size={16}/>}/>
       </div>
 
       <div className="grid lg:grid-cols-5 gap-4">
@@ -3621,12 +3677,6 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
   const fixedPart = fixedCountedItems.reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
   const antsPart = antsThisMonthList.reduce((s,e)=>s+e.amount,0);
   const monthlyOut = debtsPart + subsPart + fixedPart + antsPart;
-  const monthlyOutParts = [
-    debtsPart>0 && { label:`${fmt(debtsPart)} deuda${debtsCountedItems.length===1?'':'s'}` },
-    subsPart>0 && { label:`${fmt(subsPart)} suscripci${subsCountedItems.length===1?'ón':'ones'}` },
-    fixedPart>0 && { label:`${fmt(fixedPart)} gasto${fixedCountedItems.length===1?' fijo':'s fijos'}` },
-    antsPart>0 && { label:`${fmt(antsPart)} hormiga (${antsThisMonthList.length})` },
-  ].filter(Boolean);
 
   const Row = ({ emoji, title, subtitle, amount, positive, onEdit, onDelete }) => (
     <div className="flex items-center gap-3 py-2.5 border-t border-paper-300/60 dark:border-ink-500/40">
@@ -3682,9 +3732,9 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
           <div className="text-right max-w-[220px]">
             <div className="text-xs uppercase tracking-wider text-gray-500">Sale cada mes</div>
             <div className="font-mono text-lg text-red-400">−{fmt(monthlyOut)}</div>
-            {monthlyOutParts.length>1 && (
+            {antsPart>0 && (
               <div className="text-[11px] text-gray-500 mt-0.5 leading-snug">
-                {monthlyOutParts.map(p=>p.label).join(' + ')}
+                incluye {fmt(antsPart)} de gastos hormiga ({antsThisMonthList.length})
               </div>
             )}
           </div>
@@ -4348,7 +4398,7 @@ function ToggleRow({ emoji, name, amount, active, onToggle }) {
   );
 }
 
-function RuleCard({ r, totalIncome, accountName, debts, subs, fixed, antBudget, savingsBudget, expanded, onToggleExpand, onEdit, onDelete, onToggleLinkedItem }) {
+function RuleCard({ r, totalIncome, accountName, debts, subs, fixed, antBudget, savingsBudget, antThisMonth, expanded, onToggleExpand, onEdit, onDelete, onToggleLinkedItem }) {
   const linked = r.linkedItems || [];
   const isLinked = (type, id) => linked.some(li => li.type===type && (id===undefined ? true : li.id===id));
   const monthlySub = (s) => s.frequency==='annual' ? effectiveSubValueNow(s)/12 : effectiveSubValueNow(s);
@@ -4362,6 +4412,10 @@ function RuleCard({ r, totalIncome, accountName, debts, subs, fixed, antBudget, 
     return sum;
   }, 0), [linked, debts, subs, fixed, antBudget, savingsBudget]);
 
+  const allocatedAmount = totalIncome * ((r.percent||0)/100);
+  const overNeeded = linkedSum > allocatedAmount + 0.01; // lo vinculado necesita más de lo que esta regla tiene asignado
+  const antsOverBudget = isLinked('ants') && antBudget>0 && antThisMonth > antBudget;
+
   return (
     <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl shadow-soft overflow-hidden">
       <div className="flex items-center justify-between gap-3 p-4">
@@ -4371,7 +4425,7 @@ function RuleCard({ r, totalIncome, accountName, debts, subs, fixed, antBudget, 
             <div className="font-medium text-ink-900 dark:text-gray-100 truncate">{r.name}</div>
             <div className="text-xs text-gray-500 truncate flex items-center gap-1.5">
               <span>{accountName(r.accountId)}</span>
-              {linkedSum>0 && <span className="text-gold-500 font-mono">· necesita {fmt(linkedSum)}</span>}
+              {linkedSum>0 && <span className={overNeeded ? 'text-red-400 font-mono' : 'text-gold-500 font-mono'}>· necesita {fmt(linkedSum)}</span>}
             </div>
           </div>
         </button>
@@ -4386,6 +4440,21 @@ function RuleCard({ r, totalIncome, accountName, debts, subs, fixed, antBudget, 
           </div>
         </div>
       </div>
+
+      {(overNeeded || antsOverBudget) && (
+        <div className="px-4 pb-3 flex flex-col gap-1.5">
+          {overNeeded && (
+            <div className="flex items-center gap-1.5 text-red-400 text-xs bg-red-500/10 rounded-lg px-2.5 py-1.5">
+              <IBell size={13}/> Lo vinculado necesita {fmt(linkedSum-allocatedAmount)} más de lo que le asignaste ({fmtNum(r.percent)}%).
+            </div>
+          )}
+          {antsOverBudget && (
+            <div className="flex items-center gap-1.5 text-orange-500 text-xs bg-orange-500/10 rounded-lg px-2.5 py-1.5">
+              <IBell size={13}/> Gastos hormiga ya superó su presupuesto este mes ({fmt(antThisMonth)} de {fmt(antBudget)}).
+            </div>
+          )}
+        </div>
+      )}
 
       {expanded && (
         <div className="border-t border-paper-300/60 dark:border-ink-500/40 px-4 pb-3 pt-2 flex flex-col gap-3">
@@ -4513,7 +4582,7 @@ function SplitView({ rules, accounts, incomeAuto, salaryOverride, salaryForSplit
           <div className="lg:col-span-3 flex flex-col gap-3">
             {rules.map(r => (
               <RuleCard key={r.id} r={r} totalIncome={totalIncome} accountName={accountName}
-                debts={debts} subs={subs} fixed={fixed} antBudget={antBudget} savingsBudget={savingsBudget}
+                debts={debts} subs={subs} fixed={fixed} antBudget={antBudget} savingsBudget={savingsBudget} antThisMonth={antThisMonth}
                 expanded={expandedRuleId===r.id} onToggleExpand={()=>setExpandedRuleId(id=>id===r.id?null:r.id)}
                 onEdit={onEdit} onDelete={onDelete} onToggleLinkedItem={onToggleLinkedItem}/>
             ))}
@@ -4833,7 +4902,7 @@ function HistoryView({ items }) {
 /* =========================================================================
    USUARIO (correo, contraseña, sesión)
    ========================================================================= */
-function AccountSettingsView({ userEmail, onLogout, onExportBackup }) {
+function AccountSettingsView({ userEmail, onLogout, onExportBackup, notifsEnabled, notifPermission, onEnableNotifications, onDisableNotifications }) {
   const [newEmail, setNewEmail] = useState('');
   const [emailPassword, setEmailPassword] = useState('');
   const [emailBusy, setEmailBusy] = useState(false);
@@ -4932,6 +5001,19 @@ function AccountSettingsView({ userEmail, onLogout, onExportBackup }) {
             {passBusy ? 'Un momento…' : 'Guardar contraseña nueva'}
           </button>
         </form>
+      </div>
+
+      <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h3 className="font-medium text-ink-900 dark:text-gray-100">Notificaciones de pagos</h3>
+          <p className="text-xs text-gray-500 mt-0.5 max-w-md">Te avisa (una vez al día) qué vence mañana. Solo funciona en este dispositivo, y mientras la app esté abierta o recién cerrada — no es un aviso que llega en cualquier momento, ya que eso necesitaría un servidor propio.</p>
+          {notifPermission==='denied' && <p className="text-xs text-red-400 mt-1.5">Bloqueaste las notificaciones para este sitio en el navegador — para activarlas, cámbialo en los ajustes del sitio.</p>}
+        </div>
+        {notifsEnabled && notifPermission==='granted' ? (
+          <button onClick={onDisableNotifications} className="px-4 py-2 rounded-lg text-gray-500 border border-paper-300 dark:border-ink-500 hover:bg-paper-200 dark:hover:bg-ink-600 text-sm font-medium transition">Desactivar</button>
+        ) : (
+          <button onClick={onEnableNotifications} disabled={notifPermission==='denied'} className="px-4 py-2 rounded-lg bg-gold-500 hover:bg-gold-600 disabled:opacity-50 text-ink-900 text-sm font-medium transition">Activar</button>
+        )}
       </div>
 
       <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex items-center justify-between flex-wrap gap-3">
