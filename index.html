@@ -635,6 +635,22 @@ function effectiveMonthlyValueNow(f) {
   return effectiveMonthlyValue(f, now.getFullYear(), now.getMonth());
 }
 
+// cuánto sale de UNA cuenta concreta este mes: deudas + suscripciones + gastos fijos vinculados a
+// ella, más gastos hormiga y pagos de pocket hechos desde ella. Se usa tanto para la cuenta misma
+// como para sumar lo que sale de sus pockets (una cuenta madre "sale" también lo que salga de sus pockets).
+function accountMonthlyOut(accountId, debts, subs, fixed, antExpenses, pocketPayments) {
+  const now = new Date();
+  const linkedDebts = (debts||[]).filter(d=>d.accountId===accountId && !d.finished);
+  const linkedSubs = (subs||[]).filter(s=>s.accountId===accountId);
+  const linkedFixed = (fixed||[]).filter(f=>f.accountId===accountId);
+  const debtsPart = linkedDebts.filter(debtCountsThisMonth).reduce((s,d)=>s+(d.monthlyPayment||0),0);
+  const subsPart = linkedSubs.filter(s=>s.active && s.frequency!=='annual').reduce((s,x)=>s+effectiveSubValueNow(x),0);
+  const fixedPart = linkedFixed.filter(f=>f.paymentDay ? fixedCountsThisMonth(f) : isPaidThisCycle(f)).reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
+  const antsPart = (antExpenses||[]).filter(e=>e.accountId===accountId && isSameMonth(e.date, now)).reduce((s,e)=>s+e.amount,0);
+  const pocketPaysPart = (pocketPayments||[]).filter(e=>e.accountId===accountId && isSameMonth(e.date, now)).reduce((s,e)=>s+e.amount,0);
+  return { debtsPart, subsPart, fixedPart, antsPart, pocketPaysPart, total: debtsPart+subsPart+fixedPart+antsPart+pocketPaysPart };
+}
+
 // para suscripciones con "valor manual": mensuales usan clave "YYYY-MM", anuales usan clave "YYYY"
 // (un solo cobro al año). Si no hay valor puesto para ese ciclo, usa el precio de referencia.
 function subPeriodKey(s, y, m) {
@@ -1847,7 +1863,24 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   // cambios en cadena (el ítem → el motor de saldos → la cuenta), y sin este margen cada uno
   // lanzaba su propio guardado a Firestore por separado; si llegaban fuera de orden, el guardado
   // bueno (el ya corregido) podía quedar pisado por uno anterior con datos viejos.
+  //
+  // saveChainRef: además del debounce, esto encadena los guardados entre sí — si editas dos veces
+  // seguidas (más rápido de lo que tarda la red en confirmar el primer guardado), el segundo espera
+  // a que el primero termine antes de salir a la red. Sin esto, dos guardados podían viajar a la vez
+  // y el más viejo llegar a Firestore DESPUÉS que el más nuevo, dejando el dato viejo pisando al
+  // nuevo — así que crear/borrar/pagar podía "no quedar guardado" a la primera (o ni a la segunda).
   const latestSnapshotRef = useRef(null);
+  const saveChainRef = useRef(Promise.resolve());
+  const enqueueSave = (payload) => {
+    pendingSavesRef.current++;
+    saveChainRef.current = saveChainRef.current
+      .catch(() => {}) // si el guardado anterior falló, no dejamos que eso bloquee los siguientes
+      .then(() => store.save(payload))
+      .then(() => setSaveError(null))
+      .catch(e => { console.error('No se pudo guardar en Firestore', e); setSaveError(e && e.message ? e.message : String(e)); })
+      .finally(() => { pendingSavesRef.current = Math.max(0, pendingSavesRef.current - 1); });
+    return saveChainRef.current;
+  };
   useEffect(() => {
     latestSnapshotRef.current = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate };
   });
@@ -1855,11 +1888,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     if (!loaded) return;
     const t = setTimeout(() => {
       const payload = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate };
-      pendingSavesRef.current++;
-      store.save(payload)
-        .then(() => setSaveError(null))
-        .catch(e => { console.error('No se pudo guardar en Firestore', e); setSaveError(e && e.message ? e.message : String(e)); })
-        .finally(() => { pendingSavesRef.current = Math.max(0, pendingSavesRef.current - 1); });
+      enqueueSave(payload);
     }, 150);
     return () => clearTimeout(t);
   }, [debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate, loaded, store]);
@@ -1886,10 +1915,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   useEffect(() => {
     const flush = () => {
       if (!latestSnapshotRef.current) return;
-      pendingSavesRef.current++;
-      store.save(latestSnapshotRef.current)
-        .catch(e=>console.error('No se pudo guardar (flush)', e))
-        .finally(() => { pendingSavesRef.current = Math.max(0, pendingSavesRef.current - 1); });
+      enqueueSave(latestSnapshotRef.current);
     };
     window.addEventListener('beforeunload', flush);
     window.addEventListener('pagehide', flush);
@@ -3909,6 +3935,7 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
                          onEditSaving, onDeleteSaving, onEditIncome, onDeleteIncome, onEditAnt, onDeleteAnt, onEditPocketPayment, onDeletePocketPayment, onEditTransfer, onDeleteTransfer, onEditDebt, onDeleteDebt,
                          onEditSub, onDeleteSub, onEditFixed, onDeleteFixed, onCancelCharge, onAddPocket, onQuickTransfer, onQuickPocketPayment, onEditAccount, onDeleteAccount, onToggleAccountActive, onClose }) {
   const id = account.id;
+  const [expandedPocketId, setExpandedPocketId] = useState(null);
   const nameOf = (aid) => { const a = accounts.find(x=>x.id===aid); return a ? `${a.emoji} ${a.name}` : '—'; };
   const myPockets = accounts.filter(a => a.parentAccountId === id);
   const parentAccount = account.parentAccountId ? accounts.find(a=>a.id===account.parentAccountId) : null;
@@ -3964,7 +3991,12 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
   const fixedPart = fixedCountedItems.reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
   const antsPart = antsThisMonthList.reduce((s,e)=>s+e.amount,0);
   const pocketPaysPart = pocketPaysThisMonthList.reduce((s,e)=>s+e.amount,0);
-  const monthlyOut = debtsPart + subsPart + fixedPart + antsPart + pocketPaysPart;
+  // lo que sale de cada uno de sus pockets (deudas/suscripciones/fijos/hormiga/pagos vinculados a ELLOS,
+  // no a esta cuenta) — porque tú mandas dinero de esta cuenta a los pockets, así que lo suyo también
+  // es, en el fondo, dinero que sale de aquí.
+  const pocketsOutList = myPockets.map(p => ({ pocket: p, out: accountMonthlyOut(p.id, debts, subs, fixed, antExpenses, pocketPayments) }));
+  const pocketsOutTotal = pocketsOutList.reduce((s,x)=>s+x.out.total, 0);
+  const monthlyOut = debtsPart + subsPart + fixedPart + antsPart + pocketPaysPart + pocketsOutTotal;
 
   const hasNothing = charged.length===0 && incomes.length===0 && ants.length===0 && pocketPays.length===0 && accTransfers.length===0 && transfers.length===0 && linkedDebts.length===0 && linkedSubs.length===0 && linkedFixed.length===0;
 
@@ -3995,6 +4027,11 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
                 incluye {fmt(pocketPaysPart)} de pagos ({pocketPaysThisMonthList.length})
               </div>
             )}
+            {pocketsOutTotal>0 && (
+              <div className="text-[11px] text-gray-500 mt-0.5 leading-snug">
+                incluye {fmt(pocketsOutTotal)} de tus pockets
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -4013,23 +4050,62 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
             <p className="text-xs text-gray-500">Aún no tienes pockets aquí — son sub-cuentas con su propio saldo, separado del de {account.name}.</p>
           ) : (
             <div className="flex flex-col gap-2">
-              {myPockets.map(p => (
-                <div key={p.id} className="flex items-center justify-between gap-2 text-sm py-2 border-t border-paper-300/60 dark:border-ink-500/40">
-                  <span className="flex items-center gap-2 min-w-0">
-                    <span>{p.emoji}</span>
-                    <span className="truncate">{p.name}</span>
-                    {!p.active && <span className="text-[10px] uppercase text-gray-500 border border-paper-300 dark:border-ink-500 rounded-full px-1.5 py-0.5 shrink-0">Inactivo</span>}
-                  </span>
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <span className={`font-mono ${p.balance<0?'text-red-400':'text-ink-900 dark:text-gray-100'}`}>{fmtCur(p.balance, p.currency)}</span>
-                    <button onClick={()=>onQuickTransfer(id, p.id)} title={`Mover de ${account.name} a ${p.name}`} className="p-1.5 text-gray-500 hover:text-gold-500 transition"><IArrowRight size={15}/></button>
-                    <button onClick={()=>onQuickTransfer(p.id, id)} title={`Mover de ${p.name} a ${account.name}`} className="p-1.5 text-gray-500 hover:text-gold-500 transition"><IArrowLeft size={15}/></button>
-                    <button onClick={()=>onToggleAccountActive(p.id)} title={p.active ? 'Desactivar' : 'Activar'} className={`p-1.5 transition ${p.active ? 'text-emerald-400' : 'text-gray-400'}`}><ICheck size={15}/></button>
-                    <button onClick={()=>onEditAccount(p)} className="p-1.5 text-gray-500 hover:text-ink-900 dark:hover:text-gray-200 transition"><IEdit size={15}/></button>
-                    <button onClick={()=>onDeleteAccount(p)} className="p-1.5 text-gray-500 hover:text-red-400 transition"><ITrash size={15}/></button>
+              {myPockets.map(p => {
+                const pOut = pocketsOutList.find(x=>x.pocket.id===p.id)?.out;
+                const pDebts = debts.filter(d=>d.accountId===p.id && !d.finished);
+                const pSubs = subs.filter(s=>s.accountId===p.id);
+                const pFixed = fixed.filter(f=>f.accountId===p.id);
+                const linkedCount = pDebts.length + pSubs.length + pFixed.length;
+                const isExpanded = expandedPocketId===p.id;
+                return (
+                <div key={p.id} className="flex flex-col gap-1.5 text-sm py-2 border-t border-paper-300/60 dark:border-ink-500/40">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex items-center gap-2 min-w-0">
+                      <span>{p.emoji}</span>
+                      <span className="truncate">{p.name}</span>
+                      {!p.active && <span className="text-[10px] uppercase text-gray-500 border border-paper-300 dark:border-ink-500 rounded-full px-1.5 py-0.5 shrink-0">Inactivo</span>}
+                    </span>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <span className={`font-mono ${p.balance<0?'text-red-400':'text-ink-900 dark:text-gray-100'}`}>{fmtCur(p.balance, p.currency)}</span>
+                      <button onClick={()=>onQuickTransfer(id, p.id)} title={`Mover de ${account.name} a ${p.name}`} className="p-1.5 text-gray-500 hover:text-gold-500 transition"><IArrowRight size={15}/></button>
+                      <button onClick={()=>onQuickTransfer(p.id, id)} title={`Mover de ${p.name} a ${account.name}`} className="p-1.5 text-gray-500 hover:text-gold-500 transition"><IArrowLeft size={15}/></button>
+                      <button onClick={()=>onToggleAccountActive(p.id)} title={p.active ? 'Desactivar' : 'Activar'} className={`p-1.5 transition ${p.active ? 'text-emerald-400' : 'text-gray-400'}`}><ICheck size={15}/></button>
+                      <button onClick={()=>onEditAccount(p)} className="p-1.5 text-gray-500 hover:text-ink-900 dark:hover:text-gray-200 transition"><IEdit size={15}/></button>
+                      <button onClick={()=>onDeleteAccount(p)} className="p-1.5 text-gray-500 hover:text-red-400 transition"><ITrash size={15}/></button>
+                    </div>
                   </div>
+                  {linkedCount>0 && (
+                    <button onClick={()=>setExpandedPocketId(x=>x===p.id?null:p.id)}
+                      className="flex items-center gap-1.5 text-[11px] text-gray-500 hover:text-ink-900 dark:hover:text-gray-300 pl-7 transition text-left">
+                      <span className={`shrink-0 transition-transform ${isExpanded ? 'rotate-90' : ''}`}><IChevR size={10}/></span>
+                      {linkedCount} vinculado(s){pOut && pOut.total>0 ? ` · ${fmt(pOut.total)}/mes` : ''}
+                    </button>
+                  )}
+                  {isExpanded && (
+                    <div className="pl-7 flex flex-col gap-1 mt-0.5">
+                      {pDebts.map(d => (
+                        <div key={d.id} className="flex items-center justify-between gap-2 text-xs text-gray-600 dark:text-gray-400">
+                          <span className="flex items-center gap-1.5 min-w-0 truncate"><span>{d.emoji}</span><span className="truncate">{d.name}</span><span className="text-[9px] uppercase text-gray-400 shrink-0">Deuda</span></span>
+                          <span className="font-mono shrink-0">{fmt(d.monthlyPayment||0)}/mes</span>
+                        </div>
+                      ))}
+                      {pSubs.map(s => (
+                        <div key={s.id} className="flex items-center justify-between gap-2 text-xs text-gray-600 dark:text-gray-400">
+                          <span className="flex items-center gap-1.5 min-w-0 truncate"><span>{s.emoji}</span><span className="truncate">{s.name}</span><span className="text-[9px] uppercase text-gray-400 shrink-0">Suscripción</span></span>
+                          <span className="font-mono shrink-0">{fmt(effectiveSubValueNow(s))}/mes</span>
+                        </div>
+                      ))}
+                      {pFixed.map(f => (
+                        <div key={f.id} className="flex items-center justify-between gap-2 text-xs text-gray-600 dark:text-gray-400">
+                          <span className="flex items-center gap-1.5 min-w-0 truncate"><span>{f.emoji}</span><span className="truncate">{f.name}</span><span className="text-[9px] uppercase text-gray-400 shrink-0">Gasto fijo</span></span>
+                          <span className="font-mono shrink-0">{fmt(effectiveMonthlyValueNow(f))}/mes</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
