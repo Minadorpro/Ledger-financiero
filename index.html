@@ -498,6 +498,13 @@ function currentAnnualCycleStart(dateISO) {
 }
 // ¿ya se marcó como pagado en el ciclo actual? (para suscripciones, gastos fijos y tarjetas sin fecha límite)
 function isPaidThisCycle(item) {
+  // en modo automático no se guarda "lastPaid" a mano — el cobro se da por hecho en cuanto llega
+  // su fecha, igual que ya se hacía para gastos fijos y el calendario (isFixedPaidForMonth / isRecurringPaidForOccurrence)
+  if (item.mode === 'auto') {
+    if (item.frequency === 'annual' && item.billingDate) return nextAnnualOccurrence(item.billingDate).daysUntil <= 0;
+    const day = item.paymentDay || item.billingDay;
+    if (day) return nextOccurrenceForItem(item, day).daysUntil <= 0;
+  }
   if (!item.lastPaid) return false;
   const lastPaid = new Date(item.lastPaid); lastPaid.setHours(0,0,0,0);
   if (item.frequency==='annual' && item.billingDate) return lastPaid >= currentAnnualCycleStart(item.billingDate);
@@ -770,6 +777,23 @@ function MiniKpi({ label, value, sub, accent, icon }) {
         <div className="font-mono text-sm font-semibold text-ink-900 dark:text-gray-100 tabular-nums truncate leading-tight">{value}</div>
         {sub && <div className="text-[10px] text-gray-500 dark:text-gray-500 truncate leading-tight">{sub}</div>}
       </div>
+    </div>
+  );
+}
+
+function PendingBanner({ pending, label = "Falta por pagar este mes" }) {
+  const ok = pending <= 0;
+  return (
+    <div className="rounded-2xl p-4 flex items-center justify-between gap-3 border animate-fadein"
+      style={{ background: (ok ? '#3DDC97' : COLORS.debt) + '14', borderColor: (ok ? '#3DDC97' : COLORS.debt) + '55' }}>
+      <div className="flex items-center gap-3 min-w-0">
+        <span className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0" style={{background: (ok?'#3DDC97':COLORS.debt)+'22', color: ok?'#3DDC97':COLORS.debt}}><IBell size={17}/></span>
+        <div className="min-w-0">
+          <div className="uppercase tracking-wider text-gray-500 dark:text-gray-400 font-medium">{label}</div>
+          <div className="text-gray-500 dark:text-gray-500">{ok ? "Ya se descontó todo este mes" : "De lo comprometido este mes, aún sin descontar"}</div>
+        </div>
+      </div>
+      <div className="font-mono text-lg md:text-[22px] font-semibold tabular-nums shrink-0" style={{color: ok?'#3DDC97':COLORS.debt}}>{fmt(pending)}</div>
     </div>
   );
 }
@@ -2124,13 +2148,18 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const totalCommitted = totalDebtMonthly + subsMonthlyReal + totalFixedMonthly;
   // de lo comprometido este mes, cuánto todavía no se ha pagado/descontado
   // (los gastos fijos sin día no entran aquí: si cuentan en el total, es justo porque YA se pagaron)
-  const pendingThisMonth = useMemo(() => {
+  const debtsPendingThisMonth = useMemo(() => {
     const now = new Date(); const y = now.getFullYear(), m = now.getMonth();
-    const debtsPending = activeDebts.filter(debtCountsThisMonth).filter(d=>!isDebtPaidForOccurrence(d,y,m)).reduce((a,d)=>a+d.monthlyPayment,0);
-    const subsPending = activeSubs.filter(s=>s.frequency!=='annual').filter(s=>!isPaidThisCycle(s)).reduce((a,s)=>a+effectiveSubValueNow(s),0);
-    const fixedPending = fixedExpenses.filter(f=>f.paymentDay && fixedCountsThisMonth(f)).filter(f=>!isFixedPaidForMonth(f,y,m)).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0);
-    return debtsPending + subsPending + fixedPending;
-  }, [activeDebts, activeSubs, fixedExpenses]);
+    return activeDebts.filter(debtCountsThisMonth).filter(d=>!isDebtPaidForOccurrence(d,y,m)).reduce((a,d)=>a+d.monthlyPayment,0);
+  }, [activeDebts]);
+  const subsPendingThisMonth = useMemo(() => {
+    return activeSubs.filter(s=>s.frequency!=='annual').filter(s=>!isPaidThisCycle(s)).reduce((a,s)=>a+effectiveSubValueNow(s),0);
+  }, [activeSubs]);
+  const fixedPendingThisMonth = useMemo(() => {
+    const now = new Date(); const y = now.getFullYear(), m = now.getMonth();
+    return fixedExpenses.filter(f=>f.paymentDay && fixedCountsThisMonth(f)).filter(f=>!isFixedPaidForMonth(f,y,m)).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0);
+  }, [fixedExpenses]);
+  const pendingThisMonth = debtsPendingThisMonth + subsPendingThisMonth + fixedPendingThisMonth;
   // total ahorrado = saldo de las cuentas vinculadas a proyectos + aportes que no fueron a ninguna cuenta
   // (así no contamos dos veces: el dinero que está en una cuenta se cuenta por el saldo, no por el aporte)
   const totalSaved = useMemo(()=> {
@@ -2560,17 +2589,17 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
               {view==='debts' && (
                 <DebtsView debts={debts} accounts={accounts} onAdd={()=>setModal({type:'debt'})} onEdit={(d)=>setModal({type:'debt', item:d})}
                   onDelete={(d)=>setConfirmDel({type:'debt', id:d.id, name:d.name})} onPay={payInstallment} onUndo={undoInstallment} onFinish={finishDebt} onMarkCyclePaid={markDebtCyclePaid}
-                  totalMonthly={totalDebtMonthly} activeCount={activeDebts.length} notStarted={debtsNotStarted}/>
+                  totalMonthly={totalDebtMonthly} activeCount={activeDebts.length} notStarted={debtsNotStarted} pending={debtsPendingThisMonth}/>
               )}
               {view==='subs' && (
                 <SubsView subs={subscriptions} accounts={accounts} onAdd={()=>setModal({type:'sub'})} onEdit={(s)=>setModal({type:'sub', item:s})}
                   onDelete={(s)=>setConfirmDel({type:'sub', id:s.id, name:s.name})} onToggle={toggleSubActive} onMarkPaid={markSubPaid} onUndo={undoSubPaid}
-                  totalMonthly={subsMonthlyReal} totalAnnual={subsAnnualReal}/>
+                  totalMonthly={subsMonthlyReal} totalAnnual={subsAnnualReal} pending={subsPendingThisMonth}/>
               )}
               {view==='fixed' && (
                 <FixedView items={fixedExpenses} accounts={accounts} onAdd={()=>setModal({type:'fixed'})} onEdit={(f)=>setModal({type:'fixed', item:f})}
                   onDelete={(f)=>setConfirmDel({type:'fixed', id:f.id, name:f.name})} onMarkPaid={markFixedPaid} onUndo={undoFixedPaid} onToggleMonth={toggleFixedMonth} totalMonthly={totalFixedMonthly}
-                  withDayCount={fixedWithDayCount} noDayCount={fixedNoDayCount} noDayTotal={fixedNoDayTotal}/>
+                  withDayCount={fixedWithDayCount} noDayCount={fixedNoDayCount} noDayTotal={fixedNoDayTotal} pending={fixedPendingThisMonth}/>
               )}
               {view==='savings' && (
                 <SavingsView projects={savingsProjects} entries={savingsEntries} accounts={accounts} totalSaved={totalSaved} savedThisMonth={savedThisMonth} budget={savingsBudget} onSetBudget={setSavingsBudget}
@@ -2833,7 +2862,7 @@ function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDe
 /* =========================================================================
    DEUDAS
    ========================================================================= */
-function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, onFinish, onMarkCyclePaid, totalMonthly, activeCount, notStarted }) {
+function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, onFinish, onMarkCyclePaid, totalMonthly, activeCount, notStarted, pending }) {
   const [q, setQ] = useState('');
   const [filter, setFilter] = useState('activas');
   const filtered = debts.filter(d => {
@@ -2844,6 +2873,7 @@ function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, on
     .sort((a,b) => a._daysUntil - b._daysUntil);
   return (
     <div className="flex flex-col gap-5">
+      <PendingBanner pending={pending} label="Falta por pagar este mes (deudas)"/>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <MiniKpi label="Deudas / mes" value={fmt(totalMonthly)} sub="Lo que aplica este mes" accent={COLORS.debt} icon={<ICard size={13}/>}/>
         <MiniKpi label="Activas" value={activeCount} sub="Deuda(s) en curso" accent={COLORS.gold} icon={<IWallet size={13}/>}/>
@@ -3060,7 +3090,7 @@ function SubCard({ s, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggle }
   );
 }
 
-function SubsView({ subs, accounts, onAdd, onEdit, onDelete, onToggle, onMarkPaid, onUndo, totalMonthly, totalAnnual }) {
+function SubsView({ subs, accounts, onAdd, onEdit, onDelete, onToggle, onMarkPaid, onUndo, totalMonthly, totalAnnual, pending }) {
   const [q, setQ] = useState('');
   const [filter, setFilter] = useState('todas');
   const filtered = subs.filter(s => {
@@ -3079,6 +3109,7 @@ function SubsView({ subs, accounts, onAdd, onEdit, onDelete, onToggle, onMarkPai
 
   return (
     <div className="flex flex-col gap-5">
+      <PendingBanner pending={pending} label="Falta por pagar este mes (suscripciones)"/>
       <div className="grid sm:grid-cols-2 gap-4">
         <KpiCard label="Gasto mensual" value={fmt(totalMonthly)} sub="Solo suscripciones mensuales" accent={COLORS.sub} icon={<IRepeat size={16}/>}/>
         <KpiCard label="Gasto anual" value={fmt(totalAnnual)} sub="Solo suscripciones anuales" accent={COLORS.sub} icon={<ICalendar size={16}/>}/>
@@ -3198,13 +3229,14 @@ function FixedCard({ f, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggle
   );
 }
 
-function FixedView({ items, accounts, onAdd, onEdit, onDelete, onMarkPaid, onUndo, onToggleMonth, totalMonthly, withDayCount, noDayCount, noDayTotal }) {
+function FixedView({ items, accounts, onAdd, onEdit, onDelete, onMarkPaid, onUndo, onToggleMonth, totalMonthly, withDayCount, noDayCount, noDayTotal, pending }) {
   const [q, setQ] = useState('');
   const filtered = items.filter(f=>f.name.toLowerCase().includes(q.toLowerCase()))
     .map(f => ({ ...f, _daysUntil: f.paymentDay ? nextOccurrenceForItem(f, f.paymentDay).daysUntil : Infinity }))
     .sort((a,b) => a._daysUntil - b._daysUntil);
   return (
     <div className="flex flex-col gap-5">
+      <PendingBanner pending={pending} label="Falta por pagar este mes (gastos fijos)"/>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <MiniKpi label="Gastos fijos / mes" value={fmt(totalMonthly)} sub="Lo que aplica este mes" accent={COLORS.fixed} icon={<IReceipt size={13}/>}/>
         <MiniKpi label="No esenciales" value={fmt(items.filter(f=>f.essential===false).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0))} sub="Lo que podrías recortar" accent={COLORS.debt} icon={<IDrop size={13}/>}/>
