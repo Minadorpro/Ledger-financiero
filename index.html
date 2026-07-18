@@ -525,11 +525,23 @@ function currentAnnualCycleStart(dateISO) {
 // ¿ya se marcó como pagado en el ciclo actual? (para suscripciones, gastos fijos y tarjetas sin fecha límite)
 function isPaidThisCycle(item) {
   // en modo automático no se guarda "lastPaid" a mano — el cobro se da por hecho en cuanto llega
-  // su fecha, igual que ya se hacía para gastos fijos y el calendario (isFixedPaidForMonth / isRecurringPaidForOccurrence)
+  // su fecha, igual que ya se hacía para gastos fijos y el calendario (isFixedPaidForMonth / isRecurringPaidForOccurrence).
+  // OJO: hay que mirar la ocurrencia de ESTE ciclo (mes actual), no "la próxima" — nextOccurrenceForItem
+  // salta sola al mes siguiente en cuanto pasa el día, así que usarla aquí hacía que "pagado" durara
+  // solo el día exacto del cobro y volviera a mostrar "sin pagar" al día siguiente.
   if (item.mode === 'auto') {
-    if (item.frequency === 'annual' && item.billingDate) return nextAnnualOccurrence(item.billingDate).daysUntil <= 0;
+    if (item.frequency === 'annual' && item.billingDate) {
+      const today0 = new Date(); today0.setHours(0,0,0,0);
+      return currentAnnualCycleStart(item.billingDate) <= today0;
+    }
     const day = item.paymentDay || item.billingDay;
-    if (day) return nextOccurrenceForItem(item, day).daysUntil <= 0;
+    if (day) {
+      const now = new Date();
+      const occ = new Date(now.getFullYear(), now.getMonth(), clampDay(effectiveDay(item, now.getFullYear(), now.getMonth(), day), now.getFullYear(), now.getMonth()));
+      occ.setHours(0,0,0,0);
+      const today0 = new Date(); today0.setHours(0,0,0,0);
+      return occ <= today0;
+    }
   }
   if (!item.lastPaid) return false;
   const lastPaid = new Date(item.lastPaid); lastPaid.setHours(0,0,0,0);
@@ -1784,17 +1796,22 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const store = useMemo(() => makeDataStore(userId), [userId]);
 
   // cargar datos al montar (o si cambia el usuario)
-  // se actualiza cada vez que ESTE dispositivo guarda algo, para reconocer cuando un
-  // cambio que llega por la escucha en vivo es solo la confirmación de nuestro propio
-  // guardado (y no aplicarlo de nuevo en bucle) vs. un cambio real hecho desde otro dispositivo
-  const lastWrittenRef = useRef(null);
+  // pendingSavesRef cuenta cuántos guardados NUESTROS están en curso ahora mismo (mandados pero
+  // aún sin confirmar). Mientras haya alguno pendiente, ignoramos lo que llegue por la escucha en
+  // vivo — porque ya sabemos qué hay en Firestore (lo acabamos de escribir nosotros), no hace falta
+  // "confirmarlo" comparando texto. (Antes se comparaba el JSON de los datos entrantes contra el
+  // JSON de lo último que escribimos, pero Firestore no garantiza devolver los campos en el mismo
+  // orden, así que esa comparación podía fallar aunque los datos fueran idénticos — y entonces se
+  // pisaba el estado local recién creado con la versión vieja de Firestore, justo antes de que
+  // nuestro guardado terminara de confirmarse. Eso causaba que crear/borrar/pagar "no funcionara"
+  // a la primera.)
+  const pendingSavesRef = useRef(0);
 
   useEffect(() => {
     setLoaded(false);
     const unsubscribe = store.listen((data, hasPendingWrites) => {
       if (hasPendingWrites) return; // es nuestro propio guardado aún sin confirmar — el estado local ya lo tiene
-      const json = JSON.stringify(data);
-      if (json === lastWrittenRef.current) return; // solo confirma lo que ya habíamos escrito nosotros
+      if (pendingSavesRef.current > 0) return; // tenemos un guardado nuestro todavía en camino — no lo pisamos con esto
       const d = data || seedData();
       setDebts(d.debts || []);
       setSubscriptions(d.subscriptions || []);
@@ -1838,10 +1855,11 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     if (!loaded) return;
     const t = setTimeout(() => {
       const payload = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate };
-      lastWrittenRef.current = JSON.stringify(payload);
+      pendingSavesRef.current++;
       store.save(payload)
         .then(() => setSaveError(null))
-        .catch(e => { console.error('No se pudo guardar en Firestore', e); setSaveError(e && e.message ? e.message : String(e)); });
+        .catch(e => { console.error('No se pudo guardar en Firestore', e); setSaveError(e && e.message ? e.message : String(e)); })
+        .finally(() => { pendingSavesRef.current = Math.max(0, pendingSavesRef.current - 1); });
     }, 150);
     return () => clearTimeout(t);
   }, [debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate, loaded, store]);
@@ -1868,8 +1886,10 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   useEffect(() => {
     const flush = () => {
       if (!latestSnapshotRef.current) return;
-      lastWrittenRef.current = JSON.stringify(latestSnapshotRef.current);
-      store.save(latestSnapshotRef.current).catch(e=>console.error('No se pudo guardar (flush)', e));
+      pendingSavesRef.current++;
+      store.save(latestSnapshotRef.current)
+        .catch(e=>console.error('No se pudo guardar (flush)', e))
+        .finally(() => { pendingSavesRef.current = Math.max(0, pendingSavesRef.current - 1); });
     };
     window.addEventListener('beforeunload', flush);
     window.addEventListener('pagehide', flush);
