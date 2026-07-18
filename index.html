@@ -322,6 +322,19 @@ function orderedAccountsForSelect(accounts) {
   return out;
 }
 
+// para selectores que deben quedar acotados a "una cuenta y sus pockets" (ej. pagar desde N26 no debería
+// poder elegir Revolut). Si accountId es una cuenta madre, devuelve ella + sus pockets; si accountId es
+// un pocket, devuelve su cuenta madre + todos los pockets hermanos (incluido él mismo).
+function accountFamily(accounts, accountId) {
+  const list = accounts || [];
+  const acc = list.find(a => a.id === accountId);
+  if (!acc) return list;
+  const parentId = acc.parentAccountId || acc.id;
+  const parent = list.find(a => a.id === parentId);
+  const pockets = list.filter(a => a.parentAccountId === parentId);
+  return parent ? [parent, ...pockets] : [acc, ...pockets];
+}
+
 function fmt(n) {
   const v = Number(n) || 0;
   return v.toLocaleString('es-ES', { style:'currency', currency:'EUR', maximumFractionDigits: 2 });
@@ -1259,7 +1272,7 @@ function SavingsEntryForm({ initial, projects, accounts, onSave, onClose }) {
       toAccountId: f.toAccountId || null,
     });
   };
-  const opts = (accounts||[]);
+  const opts = orderedAccountsForSelect(accounts||[]);
   // si el proyecto elegido está vinculado a una cuenta, el destino queda fijado a esa cuenta
   const selectedProject = projects.find(p=>p.id===f.projectId);
   const lockedAccount = selectedProject && selectedProject.accountId
@@ -1280,13 +1293,13 @@ function SavingsEntryForm({ initial, projects, accounts, onSave, onClose }) {
         <Field label="Cuenta (de dónde sale)">
           <select className={inputCls} value={f.fromAccountId} onChange={e=>set('fromAccountId', e.target.value)}>
             <option value="">Sin asignar</option>
-            {opts.map(a => <option key={a.id} value={a.id}>{a.emoji} {a.name}</option>)}
+            {opts.map(a => <option key={a.id} value={a.id}>{a.parentAccountId ? '↳ ' : ''}{a.emoji} {a.name}</option>)}
           </select>
         </Field>
         <Field label="Destino (a dónde va)">
           <select className={inputCls} value={f.toAccountId} onChange={e=>set('toAccountId', e.target.value)} disabled={!!lockedAccount}>
             <option value="">Sin asignar</option>
-            {opts.map(a => <option key={a.id} value={a.id}>{a.emoji} {a.name}</option>)}
+            {opts.map(a => <option key={a.id} value={a.id}>{a.parentAccountId ? '↳ ' : ''}{a.emoji} {a.name}</option>)}
           </select>
           {lockedAccount && (
             <p className="text-xs text-gold-500 mt-1.5">
@@ -1547,6 +1560,51 @@ function AntExpenseForm({ initial, accounts, onSave, onClose }) {
   );
 }
 
+// pago rápido desde una cuenta/pocket: independiente del sistema de gasto hormiga, no afecta
+// presupuesto ni estadísticas de hormiga — solo mueve el saldo de esa cuenta.
+function PocketPaymentForm({ initial, accounts, onSave, onClose }) {
+  const [f, setF] = useState(initial || { amount:'', date: todayISO(), note:'', accountId:'' });
+  const set = (k,v) => setF(s=>({...s,[k]:v}));
+  const isEdit = !!(initial && initial.id);
+  const scopedAccounts = accountFamily(accounts, f.accountId);
+  const account = (accounts||[]).find(a=>a.id===f.accountId);
+  const submit = (e) => {
+    e.preventDefault();
+    if (!f.amount || !f.accountId) return;
+    onSave({ ...f, amount:Number(f.amount) });
+  };
+  return (
+    <form onSubmit={submit} className="flex flex-col gap-4">
+      <div className="grid grid-cols-2 gap-4">
+        <Field label="Monto (€)">
+          <input type="number" step="0.01" className={inputCls} value={f.amount} onChange={e=>set('amount', e.target.value)} required autoFocus/>
+        </Field>
+        <Field label="Fecha">
+          <input type="date" className={inputCls} value={f.date} onChange={e=>set('date', e.target.value)}/>
+        </Field>
+      </div>
+      <Field label="Pagar desde">
+        <select className={inputCls} value={f.accountId||''} onChange={e=>set('accountId', e.target.value)}>
+          {scopedAccounts.map(a => <option key={a.id} value={a.id}>{a.parentAccountId ? '↳ ' : ''}{a.emoji} {a.name}</option>)}
+        </select>
+        {!isEdit && account && (
+          <p className="text-xs text-red-400 mt-1.5">Al guardar, este monto se descontará del saldo de {account.name}. No cuenta como gasto hormiga.</p>
+        )}
+        {isEdit && (
+          <p className="text-xs text-gray-500 mt-1.5">Al editar, el saldo se ajusta solo (si cambias el monto o la cuenta).</p>
+        )}
+      </Field>
+      <Field label="Nota (opcional)">
+        <input className={inputCls} value={f.note||''} onChange={e=>set('note', e.target.value)} placeholder="Ej. Mercado, gasolina..."/>
+      </Field>
+      <div className="flex justify-end gap-2 mt-2">
+        <button type="button" onClick={onClose} className="px-4 py-2 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Cancelar</button>
+        <button type="submit" className="px-4 py-2 rounded-lg bg-gold-500 hover:bg-gold-600 text-ink-900 font-medium transition">Guardar pago</button>
+      </div>
+    </form>
+  );
+}
+
 /* =========================================================================
    REPARTO DE INGRESOS POR PORCENTAJE
    ========================================================================= */
@@ -1670,6 +1728,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const [accounts, setAccounts] = useState([]);
   const [accountsInit, setAccountsInit] = useState(false);
   const [transfers, setTransfers] = useState([]);
+  const [pocketPayments, setPocketPayments] = useState([]); // pagos rápidos desde un pocket/cuenta — solo afectan el saldo, no cuentan como gasto hormiga
   const [appliedPayments, setAppliedPayments] = useState(null); // claves de pagos ya descontados de las cuentas
   const [saveError, setSaveError] = useState(null); // mensaje visible si falla el guardado en Firestore
   const [monthlyHistory, setMonthlyHistory] = useState([]);
@@ -1720,6 +1779,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       setAccounts(needsAccounts ? DEFAULT_ACCOUNTS() : (d.accounts || []));
       setAccountsInit(true);
       setTransfers(d.transfers || []);
+      setPocketPayments(d.pocketPayments || []);
       setAppliedPayments(d.appliedPayments || null);
       setMonthlyHistory(d.monthlyHistory || []);
       setTheme(d.theme || 'dark');
@@ -1734,19 +1794,19 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   // bueno (el ya corregido) podía quedar pisado por uno anterior con datos viejos.
   const latestSnapshotRef = useRef(null);
   useEffect(() => {
-    latestSnapshotRef.current = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, appliedPayments, monthlyHistory, theme, exchangeRate };
+    latestSnapshotRef.current = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate };
   });
   useEffect(() => {
     if (!loaded) return;
     const t = setTimeout(() => {
-      const payload = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, appliedPayments, monthlyHistory, theme, exchangeRate };
+      const payload = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate };
       lastWrittenRef.current = JSON.stringify(payload);
       store.save(payload)
         .then(() => setSaveError(null))
         .catch(e => { console.error('No se pudo guardar en Firestore', e); setSaveError(e && e.message ? e.message : String(e)); });
     }, 150);
     return () => clearTimeout(t);
-  }, [debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, appliedPayments, monthlyHistory, theme, exchangeRate, loaded, store]);
+  }, [debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate, loaded, store]);
 
   // descarga un archivo .json con TODOS los datos tal como están ahora mismo — una copia de
   // seguridad tuya, en tu computadora, que no depende de mí ni de Firebase.
@@ -1931,6 +1991,16 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     ]);
     setModal(null);
   };
+  // pago rápido desde un pocket/cuenta: solo mueve el saldo, no toca gastos hormiga ni sus estadísticas/presupuesto
+  const upsertPocketPayment = (item) => {
+    const prev = item.id ? pocketPayments.find(x=>x.id===item.id) : null;
+    setPocketPayments(list => item.id ? list.map(d=>d.id===item.id? {...d,...item} : d) : [...list, {...item, id:uid()}]);
+    applyBalanceDeltas([
+      ...(prev && prev.accountId ? [{ accountId: prev.accountId, delta: prev.amount }] : []),
+      ...(item.accountId ? [{ accountId: item.accountId, delta: -item.amount }] : []),
+    ]);
+    setModal(null);
+  };
   const deleteItem = () => {
     if (!confirmDel) return;
     const { type, id } = confirmDel;
@@ -1965,6 +2035,13 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         applyBalanceDeltas([{ accountId: entry.accountId, delta: entry.amount }]);
       }
       setAntExpenses(l=>l.filter(x=>x.id!==id));
+    }
+    if (type==='pocketPayment') {
+      const entry = pocketPayments.find(x=>x.id===id);
+      if (entry && entry.accountId) {
+        applyBalanceDeltas([{ accountId: entry.accountId, delta: entry.amount }]);
+      }
+      setPocketPayments(l=>l.filter(x=>x.id!==id));
     }
     if (type==='transfer') {
       const t = transfers.find(x=>x.id===id);
@@ -2508,7 +2585,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
             </div>
             <nav className="flex flex-col gap-1">
               <NavItem icon={<IHome size={18}/>} label="Dashboard" active={view==='dashboard'} onClick={()=>setView('dashboard')} collapsed={!sidebarOpen}/>
-              <NavItem icon={<IBank size={18}/>} label="Cuentas" active={view==='accounts'||view==='accountDetail'} onClick={()=>setView('accounts')} count={accounts.length} collapsed={!sidebarOpen}/>
+              <NavItem icon={<IBank size={18}/>} label="Cuentas" active={view==='accounts'||view==='accountDetail'} onClick={()=>setView('accounts')} count={accounts.filter(a=>a.active && !a.parentAccountId).length} collapsed={!sidebarOpen}/>
               <NavItem icon={<ICard size={18}/>} label="Deudas" active={view==='debts'} onClick={()=>setView('debts')} count={activeDebts.length} collapsed={!sidebarOpen}/>
               <NavItem icon={<IRepeat size={18}/>} label="Suscripciones" active={view==='subs'} onClick={()=>setView('subs')} count={activeSubs.length} collapsed={!sidebarOpen}/>
               <NavItem icon={<IReceipt size={18}/>} label="Gastos fijos" active={view==='fixed'} onClick={()=>setView('fixed')} count={fixedExpenses.length} collapsed={!sidebarOpen}/>
@@ -2620,7 +2697,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                 const acc = accounts.find(a=>a.id===openAccountId);
                 if (!acc) return null;
                 return (
-                  <AccountDetail account={acc} accounts={accounts} savingsEntries={savingsEntries} incomeEntries={incomeEntries} antExpenses={antExpenses} transferList={transfers} duePayments={duePayments} appliedPayments={appliedPayments} exchangeRate={exchangeRate}
+                  <AccountDetail account={acc} accounts={accounts} savingsEntries={savingsEntries} incomeEntries={incomeEntries} antExpenses={antExpenses} pocketPayments={pocketPayments} transferList={transfers} duePayments={duePayments} appliedPayments={appliedPayments} exchangeRate={exchangeRate}
                     debts={debts} subs={subscriptions} fixed={fixedExpenses} projects={savingsProjects}
                     onEditSaving={(e)=>setModal({type:'saving', item:e})}
                     onDeleteSaving={(e)=>setConfirmDel({type:'saving', id:e.id, name:fmt(e.amount)})}
@@ -2628,6 +2705,8 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                     onDeleteIncome={(e)=>setConfirmDel({type:'income', id:e.id, name:fmt(e.amount)})}
                     onEditAnt={(e)=>setModal({type:'ant', item:e})}
                     onDeleteAnt={(e)=>setConfirmDel({type:'ant', id:e.id, name:fmt(e.amount)})}
+                    onEditPocketPayment={(e)=>setModal({type:'pocketPayment', item:e})}
+                    onDeletePocketPayment={(e)=>setConfirmDel({type:'pocketPayment', id:e.id, name:fmt(e.amount)})}
                     onEditTransfer={(t)=>setModal({type:'transfer', item:t})}
                     onDeleteTransfer={(t)=>setConfirmDel({type:'transfer', id:t.id, name:fmt(t.amount)})}
                     onEditDebt={(d)=>setModal({type:'debt', item:d})}
@@ -2639,6 +2718,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                     onCancelCharge={(c)=>setConfirmDel({type:'appliedCharge', ...c})}
                     onAddPocket={(parentId)=>setModal({type:'account', defaultParentId:parentId})}
                     onQuickTransfer={(fromId, toId)=>setModal({type:'transfer', item:{fromAccountId:fromId, toAccountId:toId}})}
+                    onQuickPocketPayment={(accId)=>setModal({type:'pocketPayment', item:{amount:'', date:todayISO(), note:'', accountId:accId}})}
                     onEditAccount={(a)=>setModal({type:'account', item:a})}
                     onDeleteAccount={(a)=>setConfirmDel({type:'account', id:a.id, name:a.name})}
                     onToggleAccountActive={toggleAccountActive}
@@ -2765,6 +2845,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         {modal?.type==='account' && <Modal title={modal.item? 'Editar cuenta':(modal.defaultParentId ? 'Nuevo pocket':'Nueva cuenta')} onClose={()=>setModal(null)}><AccountForm initial={modal.item} accounts={accounts} defaultParentId={modal.defaultParentId} onSave={upsertAccount} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='income' && <Modal title={modal.item? 'Editar entrada':'Nueva entrada'} onClose={()=>setModal(null)}><IncomeForm initial={modal.item} accounts={accounts} onSave={upsertIncome} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='ant' && <Modal title={modal.item? 'Editar gasto hormiga':'Nuevo gasto hormiga'} onClose={()=>setModal(null)}><AntExpenseForm initial={modal.item} accounts={accounts} onSave={upsertAnt} onClose={()=>setModal(null)}/></Modal>}
+        {modal?.type==='pocketPayment' && <Modal title={modal.item && modal.item.id ? 'Editar pago' : 'Nuevo pago'} onClose={()=>setModal(null)}><PocketPaymentForm initial={modal.item} accounts={accounts} onSave={upsertPocketPayment} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='splitRule' && (() => {
           const usedPercent = incomeSplitRules.filter(r=>!modal.item || r.id!==modal.item.id).reduce((s,r)=>s+(r.percent||0),0);
           return (
@@ -3001,7 +3082,7 @@ function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, on
               })());
           const overdueDebt = !d.finished && d.mode!=='auto' && !monthPaid
             && debtStarted(d)
-            && nowD.getDate() > clampDay(d.paymentDay, nowD.getFullYear(), nowD.getMonth());
+            && nowD.getDate() > clampDay(effectiveDay(d, nowD.getFullYear(), nowD.getMonth(), d.paymentDay), nowD.getFullYear(), nowD.getMonth());
           // "Pagado" solo se muestra el día exacto en que se marcó/pagó (auto: el mismo día del cargo;
           // manual: el día que se hizo clic en "marcar"). El resto de días muestra el conteo normal.
           const paidToday = d.mode==='auto'
@@ -3099,7 +3180,7 @@ function SubCard({ s, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggle }
   const nowS = new Date();
   const overdue = s.active && s.mode!=='auto' && !paid && s.frequency!=='annual'
     && startedByMonth(s.startDate, nowS.getFullYear(), nowS.getMonth())
-    && nowS.getDate() > clampDay(s.billingDay, nowS.getFullYear(), nowS.getMonth());
+    && nowS.getDate() > clampDay(effectiveDay(s, nowS.getFullYear(), nowS.getMonth(), s.billingDay), nowS.getFullYear(), nowS.getMonth());
   const paidToday = s.mode==='auto' ? (daysUntil===0 && paid) : (s.lastPaid===todayISO());
   const displayAmount = effectiveSubValueNow(s);
 
@@ -3247,7 +3328,7 @@ function FixedCard({ f, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggle
   // atrasado: el día de este mes ya pasó y nunca se marcó como pagado
   const overdue = !!f.paymentDay && f.mode!=='auto' && !paid
     && startedByMonth(f.startDate, now.getFullYear(), now.getMonth())
-    && now.getDate() > clampDay(f.paymentDay, now.getFullYear(), now.getMonth());
+    && now.getDate() > clampDay(effectiveDay(f, now.getFullYear(), now.getMonth(), f.paymentDay), now.getFullYear(), now.getMonth());
   const paidToday = f.mode==='auto' ? (daysUntil===0 && paid) : (f.lastPaid===todayISO());
   const displayAmount = effectiveMonthlyValueNow(f);
 
@@ -3766,9 +3847,9 @@ function MiniCollapsible({ title, count, children }) {
   );
 }
 
-function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antExpenses, transferList, duePayments, appliedPayments, debts, subs, fixed, projects, exchangeRate,
-                         onEditSaving, onDeleteSaving, onEditIncome, onDeleteIncome, onEditAnt, onDeleteAnt, onEditTransfer, onDeleteTransfer, onEditDebt, onDeleteDebt,
-                         onEditSub, onDeleteSub, onEditFixed, onDeleteFixed, onCancelCharge, onAddPocket, onQuickTransfer, onEditAccount, onDeleteAccount, onToggleAccountActive, onClose }) {
+function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antExpenses, pocketPayments, transferList, duePayments, appliedPayments, debts, subs, fixed, projects, exchangeRate,
+                         onEditSaving, onDeleteSaving, onEditIncome, onDeleteIncome, onEditAnt, onDeleteAnt, onEditPocketPayment, onDeletePocketPayment, onEditTransfer, onDeleteTransfer, onEditDebt, onDeleteDebt,
+                         onEditSub, onDeleteSub, onEditFixed, onDeleteFixed, onCancelCharge, onAddPocket, onQuickTransfer, onQuickPocketPayment, onEditAccount, onDeleteAccount, onToggleAccountActive, onClose }) {
   const id = account.id;
   const nameOf = (aid) => { const a = accounts.find(x=>x.id===aid); return a ? `${a.emoji} ${a.name}` : '—'; };
   const myPockets = accounts.filter(a => a.parentAccountId === id);
@@ -3798,6 +3879,10 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
     .filter(e => e.accountId===id)
     .sort((a,b)=> new Date(b.date) - new Date(a.date));
 
+  const pocketPays = (pocketPayments||[])
+    .filter(e => e.accountId===id)
+    .sort((a,b)=> new Date(b.date) - new Date(a.date));
+
   const accTransfers = (transferList||[])
     .filter(t => t.fromAccountId===id || t.toAccountId===id)
     .sort((a,b)=> new Date(b.date) - new Date(a.date));
@@ -3815,11 +3900,13 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
   const subsCountedItems = linkedSubs.filter(s=>s.active && s.frequency!=='annual');
   const fixedCountedItems = linkedFixed.filter(f=>f.paymentDay ? fixedCountsThisMonth(f) : isPaidThisCycle(f));
   const antsThisMonthList = ants.filter(e=>isSameMonth(e.date, nowMO));
+  const pocketPaysThisMonthList = pocketPays.filter(e=>isSameMonth(e.date, nowMO));
   const debtsPart = debtsCountedItems.reduce((s,d)=>s+(d.monthlyPayment||0),0);
   const subsPart = subsCountedItems.reduce((s,x)=>s+effectiveSubValueNow(x),0);
   const fixedPart = fixedCountedItems.reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
   const antsPart = antsThisMonthList.reduce((s,e)=>s+e.amount,0);
-  const monthlyOut = debtsPart + subsPart + fixedPart + antsPart;
+  const pocketPaysPart = pocketPaysThisMonthList.reduce((s,e)=>s+e.amount,0);
+  const monthlyOut = debtsPart + subsPart + fixedPart + antsPart + pocketPaysPart;
 
   const Row = ({ emoji, title, subtitle, amount, positive, onEdit, onDelete }) => (
     <div className="flex items-center gap-3 py-2.5 border-t border-paper-300/60 dark:border-ink-500/40">
@@ -3840,7 +3927,7 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
     </div>
   );
 
-  const hasNothing = charged.length===0 && incomes.length===0 && ants.length===0 && accTransfers.length===0 && transfers.length===0 && linkedDebts.length===0 && linkedSubs.length===0 && linkedFixed.length===0;
+  const hasNothing = charged.length===0 && incomes.length===0 && ants.length===0 && pocketPays.length===0 && accTransfers.length===0 && transfers.length===0 && linkedDebts.length===0 && linkedSubs.length===0 && linkedFixed.length===0;
 
   // secciones plegables
   const Section = ({ title, count, children }) => {
@@ -3880,9 +3967,18 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
                 incluye {fmt(antsPart)} de gastos hormiga ({antsThisMonthList.length})
               </div>
             )}
+            {pocketPaysPart>0 && (
+              <div className="text-[11px] text-gray-500 mt-0.5 leading-snug">
+                incluye {fmt(pocketPaysPart)} de pagos ({pocketPaysThisMonthList.length})
+              </div>
+            )}
           </div>
         )}
       </div>
+
+      <button onClick={()=>onQuickPocketPayment(id)} className="self-start flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3.5 py-2 rounded-lg transition">
+        <IWallet size={14}/> Pagar desde {account.name}
+      </button>
 
       {!account.parentAccountId && (
         <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-4 shadow-soft flex flex-col gap-3">
@@ -3958,6 +4054,17 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
               subtitle={`${fmtDate(e.date)}${e.category ? ` · ${e.category}` : ''}`}
               amount={e.amount} positive={false}
               onEdit={()=>onEditAnt(e)} onDelete={()=>onDeleteAnt(e)}/>
+          ))}
+        </MiniCollapsible>
+      )}
+
+      {pocketPays.length>0 && (
+        <MiniCollapsible title="Pagos" count={pocketPays.length}>
+          {pocketPays.map(e => (
+            <Row key={e.id} emoji="💳" title={e.note || 'Pago'}
+              subtitle={fmtDate(e.date)}
+              amount={e.amount} positive={false}
+              onEdit={()=>onEditPocketPayment(e)} onDelete={()=>onDeletePocketPayment(e)}/>
           ))}
         </MiniCollapsible>
       )}
