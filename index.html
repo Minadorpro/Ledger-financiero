@@ -798,6 +798,32 @@ function PendingBanner({ pending, label = "Falta por pagar este mes" }) {
   );
 }
 
+function Sparkline({ data, color = COLORS.gold, height = 56 }) {
+  if (!data || data.length < 2) {
+    return <div className="text-gray-500 dark:text-gray-500 text-sm py-6 text-center">Todavía no hay suficiente historial — vuelve en un par de meses para ver la tendencia.</div>;
+  }
+  const values = data.map(d => d.value);
+  const max = Math.max(...values), min = Math.min(...values);
+  const range = (max - min) || 1;
+  const w = 300;
+  const stepX = values.length > 1 ? w / (values.length - 1) : 0;
+  const toY = (v) => height - ((v - min) / range) * (height - 10) - 5;
+  const points = values.map((v, i) => `${i * stepX},${toY(v)}`).join(' ');
+  return (
+    <div>
+      <svg viewBox={`0 0 ${w} ${height}`} className="w-full" style={{ height }} preserveAspectRatio="none">
+        <polyline points={points} fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
+        {values.map((v, i) => (
+          <circle key={i} cx={i * stepX} cy={toY(v)} r={i === values.length - 1 ? 3.5 : 2} fill={color}/>
+        ))}
+      </svg>
+      <div className="flex justify-between text-[10px] text-gray-500 dark:text-gray-500 mt-1">
+        {data.map((d, i) => <span key={i}>{MESES[Number(d.key.split('-')[1]) - 1].slice(0, 3)}</span>)}
+      </div>
+    </div>
+  );
+}
+
 function Pill({ children, active, onClick, color }) {
   return (
     <button onClick={onClick}
@@ -2322,13 +2348,31 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       income: Math.round(incomeThisMonth*100)/100,
       ants: Math.round(antThisMonth*100)/100,
       net: Math.round(netFlowThisMonth*100)/100,
+      pending: Math.round(pendingThisMonth*100)/100,
     };
     setMonthlyHistory(prev => {
       const existing = prev.find(h=>h.key===key);
-      if (existing && existing.committed===snapshot.committed && existing.income===snapshot.income && existing.ants===snapshot.ants) return prev;
+      if (existing && existing.committed===snapshot.committed && existing.income===snapshot.income && existing.ants===snapshot.ants && existing.pending===snapshot.pending) return prev;
       return [...prev.filter(h=>h.key!==key), snapshot].sort((a,b)=>a.key.localeCompare(b.key));
     });
-  }, [loaded, totalCommitted, incomeThisMonth, antThisMonth, netFlowThisMonth]);
+  }, [loaded, totalCommitted, incomeThisMonth, antThisMonth, netFlowThisMonth, pendingThisMonth]);
+
+  // racha: meses seguidos (contando desde el más reciente hacia atrás) en los que ya no quedaba nada
+  // pendiente de pagar. Solo cuenta con datos que tengan el campo "pending" registrado (desde que existe este seguimiento).
+  const paymentStreak = useMemo(() => {
+    const sorted = [...monthlyHistory].sort((a,b)=>a.key.localeCompare(b.key));
+    let streak = 0;
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      if (sorted[i].pending !== undefined && sorted[i].pending <= 0.01) streak++;
+      else break;
+    }
+    return streak;
+  }, [monthlyHistory]);
+
+  // tendencia de "comprometido / mes" en los últimos meses, para el mini-gráfico del Dashboard
+  const committedTrend = useMemo(() => {
+    return [...monthlyHistory].sort((a,b)=>a.key.localeCompare(b.key)).slice(-6).map(h => ({ key: h.key, value: h.committed }));
+  }, [monthlyHistory]);
 
   const monthsToFreedom = useMemo(()=> installmentDebts.length ? Math.max(...installmentDebts.map(d=>d.totalInstallments-effectivePaid(d))) : 0, [installmentDebts]);
   const freedomDate = useMemo(()=> monthsToFreedom ? addMonths(new Date(), monthsToFreedom) : null, [monthsToFreedom]);
@@ -2342,14 +2386,28 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   // próximos pagos (14 días) combinando las 3 fuentes
   const upcoming = useMemo(() => {
     const rows = [];
-    activeDebts.forEach(d => { const {date,daysUntil} = nextDebtOccurrence(d); rows.push({ id:d.id, type:'debt', name:d.name, emoji:d.emoji, amount:d.monthlyPayment, date, daysUntil, mode:d.mode, paidThisCycle: d.noEndDate ? isPaidThisCycle(d) : false }); });
+    activeDebts.forEach(d => { const {date,daysUntil} = nextDebtOccurrence(d); rows.push({ id:d.id, type:'debt', name:d.name, emoji:d.emoji, amount:d.monthlyPayment, date, daysUntil, mode:d.mode, accountId:d.accountId, paidThisCycle: d.noEndDate ? isPaidThisCycle(d) : false }); });
     activeSubs.forEach(s => {
       const {date,daysUntil} = s.frequency==='annual' ? nextAnnualOccurrence(s.billingDate || todayISO()) : nextOccurrenceForItem(s, s.billingDay);
-      rows.push({ id:s.id, type:'sub', name:s.name, emoji:s.emoji, amount: effectiveSubValueNow(s), date, daysUntil, mode:s.mode, paidThisCycle: isPaidThisCycle(s) });
+      rows.push({ id:s.id, type:'sub', name:s.name, emoji:s.emoji, amount: effectiveSubValueNow(s), date, daysUntil, mode:s.mode, accountId:s.accountId, paidThisCycle: isPaidThisCycle(s) });
     });
-    fixedExpenses.forEach(f => { if (!f.paymentDay) return; const {date,daysUntil} = nextOccurrenceForItem(f, f.paymentDay); rows.push({ id:f.id, type:'fixed', name:f.name, emoji:f.emoji, amount:effectiveMonthlyValueNow(f), date, daysUntil, mode:f.mode, paidThisCycle: isPaidThisCycle(f) }); });
+    fixedExpenses.forEach(f => { if (!f.paymentDay) return; const {date,daysUntil} = nextOccurrenceForItem(f, f.paymentDay); rows.push({ id:f.id, type:'fixed', name:f.name, emoji:f.emoji, amount:effectiveMonthlyValueNow(f), date, daysUntil, mode:f.mode, accountId:f.accountId, paidThisCycle: isPaidThisCycle(f) }); });
     return rows.filter(r=>r.daysUntil<=14).sort((a,b)=>a.daysUntil-b.daysUntil);
   }, [activeDebts, activeSubs, fixedExpenses]);
+
+  // alerta de saldo insuficiente: cruza lo que le toca pagar esta semana a cada cuenta contra su saldo disponible
+  const balanceAlerts = useMemo(() => {
+    const soon = upcoming.filter(u => u.daysUntil <= 7 && u.accountId);
+    const byAccount = {};
+    soon.forEach(u => { byAccount[u.accountId] = (byAccount[u.accountId] || 0) + u.amount; });
+    return Object.entries(byAccount).map(([accId, needed]) => {
+      const acc = accounts.find(a => a.id === accId && a.active);
+      if (!acc) return null;
+      const available = accountBalanceInEur(acc, exchangeRate);
+      if (needed > available + 0.01) return { accountId: accId, name: acc.name, needed, available, shortfall: needed - available };
+      return null;
+    }).filter(Boolean);
+  }, [upcoming, accounts, exchangeRate]);
 
   // los recordatorios solo tienen sentido para lo que pagas tú manualmente y aún no has marcado como pagado
   const reminders = useMemo(()=> upcoming.filter(u=>u.daysUntil<=3 && u.mode!=='auto' && !u.paidThisCycle).map(u=>{
@@ -2538,13 +2596,14 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
               {view==='dashboard' && (
                 <Dashboard
                   totalCommitted={totalCommitted} pendingThisMonth={pendingThisMonth} totalDebtMonthly={totalDebtMonthly} totalDebtPending={totalDebtPending}
-                  totalSubMonthly={subsMonthlyReal} totalFixedMonthly={totalFixedMonthly} totalSaved={totalSaved}
+                  totalSubMonthly={subsMonthlyReal} totalFixedMonthly={totalFixedMonthly} totalSaved={totalSaved} savedThisMonth={savedThisMonth}
                   monthsToFreedom={monthsToFreedom} freedomDate={freedomDate}
                   distribution={distribution} upcoming={upcoming} reminders={reminders}
                   activeDebtsCount={activeDebts.length}
                   incomeThisMonth={incomeThisMonth} antThisMonth={antThisMonth} netFlowThisMonth={netFlowThisMonth}
                   hasIncomeData={incomeEntries.length>0}
                   netWorth={netWorth} hasAccounts={accounts.length>0}
+                  paymentStreak={paymentStreak} committedTrend={committedTrend} balanceAlerts={balanceAlerts}
                 />
               )}
               {view==='accounts' && (
@@ -2757,13 +2816,34 @@ function AddButton({ view, onAdd }) {
 /* =========================================================================
    DASHBOARD
    ========================================================================= */
-function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDebtPending, totalSubMonthly, totalFixedMonthly, totalSaved, monthsToFreedom, freedomDate, distribution, upcoming, reminders, activeDebtsCount, incomeThisMonth, antThisMonth, netFlowThisMonth, hasIncomeData, netWorth, hasAccounts }) {
+function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDebtPending, totalSubMonthly, totalFixedMonthly, totalSaved, savedThisMonth, monthsToFreedom, freedomDate, distribution, upcoming, reminders, activeDebtsCount, incomeThisMonth, antThisMonth, netFlowThisMonth, hasIncomeData, netWorth, hasAccounts, paymentStreak, committedTrend, balanceAlerts }) {
   return (
     <div className="flex flex-col gap-6">
       {reminders.length>0 && (
         <div className="flex flex-col gap-2 bg-gold-500/10 border border-gold-500/30 rounded-2xl p-4 animate-fadein">
           <div className="flex items-center gap-2 text-sm font-medium"><IBell size={16}/> Recordatorios</div>
           {reminders.map(r => <div key={r.key} className="text-gray-700 dark:text-gray-300 pl-6">{r.text}</div>)}
+        </div>
+      )}
+
+      {balanceAlerts.length>0 && (
+        <div className="flex flex-col gap-2 bg-red-500/10 border border-red-500/30 rounded-2xl p-4 animate-fadein">
+          <div className="flex items-center gap-2 text-sm font-medium text-red-400"><IBell size={16}/> Saldo insuficiente para lo que viene esta semana</div>
+          {balanceAlerts.map(a => (
+            <div key={a.accountId} className="text-gray-700 dark:text-gray-300 pl-6 text-sm">
+              <span className="font-medium">{a.name}</span>: tiene {fmt(a.available)} pero le tocan {fmt(a.needed)} esta semana — faltarían {fmt(a.shortfall)}.
+            </div>
+          ))}
+        </div>
+      )}
+
+      {paymentStreak>0 && (
+        <div className="flex items-center gap-3 bg-gold-500/10 border border-gold-500/30 rounded-2xl p-4 animate-fadein">
+          <span className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0 bg-gold-500/20 text-gold-500"><IFlag size={17}/></span>
+          <div>
+            <div className="font-medium text-ink-900 dark:text-gray-100">Llevas {paymentStreak} {paymentStreak===1?'mes':'meses'} seguido{paymentStreak===1?'':'s'} sin nada pendiente</div>
+            <div className="text-gray-500 dark:text-gray-500 text-xs mt-0.5">Sigue así — cada mes que termines al día suma a la racha.</div>
+          </div>
         </div>
       )}
 
@@ -2776,11 +2856,11 @@ function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDe
               <div className="text-gray-500 text-xs mt-1">Entradas</div>
             </div>
             <div>
-              <div className="font-mono text-lg text-red-400">-{fmt(totalCommitted + antThisMonth)}</div>
-              <div className="text-gray-500 text-xs mt-1">Comprometido + hormiga</div>
+              <div className="font-mono text-lg text-red-400">-{fmt(totalCommitted + antThisMonth + savedThisMonth)}</div>
+              <div className="text-gray-500 text-xs mt-1">Comprometido + hormiga + ahorro</div>
             </div>
             <div>
-              <div className={`font-mono text-lg font-semibold ${netFlowThisMonth>=0 ? 'text-gold-500' : 'text-red-400'}`}>{fmt(netFlowThisMonth)}</div>
+              <div className={`font-mono text-lg font-semibold ${(netFlowThisMonth-savedThisMonth)>=0 ? 'text-gold-500' : 'text-red-400'}`}>{fmt(netFlowThisMonth-savedThisMonth)}</div>
               <div className="text-gray-500 text-xs mt-1">Te queda</div>
             </div>
           </div>
@@ -2788,20 +2868,24 @@ function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDe
       )}
 
       <div className={`grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4`}>
-        <KpiCard label="Deuda pendiente" value={fmt(totalDebtPending)} sub={`${activeDebtsCount} deuda(s) activa(s)`} accent={COLORS.debt} icon={<ICard size={16}/>}/>
+        <KpiCard label="Deuda / mes" value={fmt(totalDebtMonthly)} sub="Lo que aplica este mes" accent={COLORS.debt} icon={<ICard size={16}/>}/>
         <KpiCard label="Suscripciones / mes" value={fmt(totalSubMonthly)} sub="Servicios activos" accent={COLORS.sub} icon={<IRepeat size={16}/>}/>
         <KpiCard label="Gastos fijos / mes" value={fmt(totalFixedMonthly)} sub="Alquiler, servicios, seguros…" accent={COLORS.fixed} icon={<IReceipt size={16}/>}/>
-        <KpiCard label="Ahorrado" value={fmt(totalSaved)} sub="Total en tus proyectos" accent="#3DDC97" icon={<IPiggy size={16}/>}/>
+        <KpiCard label="Ahorro / mes" value={fmt(savedThisMonth)} sub="Aportado este mes" accent="#3DDC97" icon={<IPiggy size={16}/>}/>
       </div>
 
-      <div className={`grid grid-cols-1 ${hasAccounts ? 'sm:grid-cols-3' : 'sm:grid-cols-2'} gap-4`}>
-        {hasAccounts && (
-          <KpiCard label="Valor neto" value={fmt(netWorth)} sub="Saldo de tus cuentas"
-            accent={netWorth >= 0 ? '#3DDC97' : COLORS.debt} icon={<IBank size={16}/>}/>
-        )}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <KpiCard label="Deuda pendiente" value={fmt(totalDebtPending)} sub={`${activeDebtsCount} deuda(s) activa(s)`} accent={COLORS.debt} icon={<ICard size={16}/>}/>
         <KpiCard label="Comprometido / mes" value={fmt(totalCommitted)} sub="Deudas + suscripciones + fijos" accent={COLORS.gold} icon={<IWallet size={16}/>}/>
         <KpiCard label="Falta por pagar" value={fmt(pendingThisMonth)} sub={pendingThisMonth>0 ? "De lo comprometido, aún sin descontar" : "Ya se descontó todo este mes"} accent={pendingThisMonth>0 ? COLORS.debt : '#3DDC97'} icon={<IBell size={16}/>}/>
       </div>
+
+      {hasAccounts && (
+        <div className="grid grid-cols-1 gap-4">
+          <KpiCard label="Valor neto" value={fmt(netWorth)} sub="Saldo de tus cuentas"
+            accent={netWorth >= 0 ? '#3DDC97' : COLORS.debt} icon={<IBank size={16}/>}/>
+        </div>
+      )}
 
       <div className="grid lg:grid-cols-5 gap-4">
         <div className="lg:col-span-2 bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex flex-col gap-1">
@@ -2836,6 +2920,13 @@ function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDe
               </div>
             </div>
           ) : <div className="dark:text-gray-500 py-8 text-center">Añade deudas, suscripciones o gastos para ver tu distribución.</div>}
+        </div>
+      </div>
+
+      <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft">
+        <span className="uppercase tracking-wider text-gray-500 dark:text-gray-400 font-medium">Tendencia de lo comprometido</span>
+        <div className="mt-3">
+          <Sparkline data={committedTrend} color={COLORS.gold}/>
         </div>
       </div>
 
