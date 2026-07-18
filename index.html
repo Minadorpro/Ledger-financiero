@@ -83,6 +83,19 @@
 </style>
 </head>
 <body class="font-sans antialiased">
+<div id="__splash" style="position:fixed;inset:0;z-index:99999;background:#0F1115;transition:opacity .2s ease;"></div>
+<script>
+  // el color de fondo real de la app depende de tu tema guardado (que solo se sabe tras cargar
+  // Firestore), así que aquí usamos el último tema visto (guardado en localStorage) para que la
+  // pantalla de carga arranque ya con el color correcto y no haya un parpadeo oscuro/claro.
+  (function(){
+    try {
+      var t = localStorage.getItem('ledger_theme') || 'dark';
+      var el = document.getElementById('__splash');
+      if (el) el.style.background = (t === 'dark') ? '#0F1115' : '#F5F1E8';
+    } catch(e) {}
+  })();
+</script>
 <div id="root"></div>
 
 <script type="text/babel" data-presets="react,typescript" data-type="module">
@@ -790,6 +803,30 @@ function MiniKpi({ label, value, sub, accent, icon }) {
         <div className="font-mono text-sm font-semibold text-ink-900 dark:text-gray-100 tabular-nums truncate leading-tight">{value}</div>
         {sub && <div className="text-[10px] text-gray-500 dark:text-gray-500 truncate leading-tight">{sub}</div>}
       </div>
+    </div>
+  );
+}
+
+// fila de movimiento reutilizada en el detalle de cuenta (entradas, hormiga, pagos, transferencias, etc.)
+// — como componente de nivel superior, para que React no la desmonte/remonte (y repita la animación
+// de entrada) cada vez que AccountDetail vuelve a renderizar.
+function Row({ emoji, title, subtitle, amount, positive, onEdit, onDelete }) {
+  return (
+    <div className="flex items-center gap-3 py-2.5 border-t border-paper-300/60 dark:border-ink-500/40">
+      <span className="text-xl shrink-0">{emoji}</span>
+      <div className="flex-1 min-w-0">
+        <div className="text-sm text-ink-900 dark:text-gray-100 truncate">{title}</div>
+        <div className="text-xs text-gray-500 truncate">{subtitle}</div>
+      </div>
+      <span className={`font-mono text-sm shrink-0 ${positive ? 'text-emerald-400' : 'text-red-400'}`}>
+        {positive ? '+' : '−'}{fmt(Math.abs(amount))}
+      </span>
+      {(onEdit || onDelete) ? (
+        <div className="flex gap-1 shrink-0">
+          <button onClick={onEdit} className="p-1.5 text-gray-500 hover:text-ink-900 dark:hover:text-gray-200 transition"><IEdit size={15}/></button>
+          <button onClick={onDelete} className="p-1.5 text-gray-500 hover:text-red-400 transition"><ITrash size={15}/></button>
+        </div>
+      ) : <div className="w-[62px] shrink-0"/>}
     </div>
   );
 }
@@ -1710,6 +1747,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const [notifsEnabled, setNotifsEnabled] = useState(() => localStorage.getItem('ledger_notifs') === 'on');
   const [notifPermission, setNotifPermission] = useState(() => (typeof Notification!=='undefined' ? Notification.permission : 'unsupported'));
   const [theme, setTheme] = useState('dark');
+  useEffect(() => { try { localStorage.setItem('ledger_theme', theme); } catch(e) {} }, [theme]);
   const [debts, setDebts] = useState([]);
   const [subscriptions, setSubscriptions] = useState([]);
   const [fixedExpenses, setFixedExpenses] = useState([]);
@@ -3908,42 +3946,7 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
   const pocketPaysPart = pocketPaysThisMonthList.reduce((s,e)=>s+e.amount,0);
   const monthlyOut = debtsPart + subsPart + fixedPart + antsPart + pocketPaysPart;
 
-  const Row = ({ emoji, title, subtitle, amount, positive, onEdit, onDelete }) => (
-    <div className="flex items-center gap-3 py-2.5 border-t border-paper-300/60 dark:border-ink-500/40">
-      <span className="text-xl shrink-0">{emoji}</span>
-      <div className="flex-1 min-w-0">
-        <div className="text-sm text-ink-900 dark:text-gray-100 truncate">{title}</div>
-        <div className="text-xs text-gray-500 truncate">{subtitle}</div>
-      </div>
-      <span className={`font-mono text-sm shrink-0 ${positive ? 'text-emerald-400' : 'text-red-400'}`}>
-        {positive ? '+' : '−'}{fmt(Math.abs(amount))}
-      </span>
-      {(onEdit || onDelete) ? (
-        <div className="flex gap-1 shrink-0">
-          <button onClick={onEdit} className="p-1.5 text-gray-500 hover:text-ink-900 dark:hover:text-gray-200 transition"><IEdit size={15}/></button>
-          <button onClick={onDelete} className="p-1.5 text-gray-500 hover:text-red-400 transition"><ITrash size={15}/></button>
-        </div>
-      ) : <div className="w-[62px] shrink-0"/>}
-    </div>
-  );
-
   const hasNothing = charged.length===0 && incomes.length===0 && ants.length===0 && pocketPays.length===0 && accTransfers.length===0 && transfers.length===0 && linkedDebts.length===0 && linkedSubs.length===0 && linkedFixed.length===0;
-
-  // secciones plegables
-  const Section = ({ title, count, children }) => {
-    const [open, setOpen] = useState(true);
-    return (
-      <div>
-        <button onClick={()=>setOpen(o=>!o)}
-          className="w-full flex items-center gap-1.5 text-xs uppercase tracking-wider text-gray-500 font-medium mb-1 hover:text-ink-900 dark:hover:text-gray-300 transition">
-          <span className={`transition-transform ${open ? 'rotate-90' : ''}`}>▸</span>
-          {title}
-          <span className="text-gray-400 normal-case">({count})</span>
-        </button>
-        {open && children}
-      </div>
-    );
-  };
 
   return (
     <div className="flex flex-col gap-4">
@@ -4142,20 +4145,10 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
   );
 }
 
-function AccountsView({ accounts, netWorth, accountsInNet, onAdd, onEdit, onDelete, onToggleActive, onToggleInNet, onOpen, onAddPocket, debts, subs, fixed, exchangeRate, onSetExchangeRate }) {
-  // los pockets NO se muestran aquí sueltos — solo dentro del detalle de su cuenta madre
-  const active = accounts.filter(a=>a.active && !a.parentAccountId);
-  const inactive = accounts.filter(a=>!a.active && !a.parentAccountId);
-  const positives = accounts.filter(a=>a.active && a.includeInNet && a.balance>0).reduce((s,a)=>s+accountBalanceInEur(a, exchangeRate),0);
-  const negatives = accounts.filter(a=>a.active && a.includeInNet && a.balance<0).reduce((s,a)=>s+accountBalanceInEur(a, exchangeRate),0);
-  const hasUsd = accounts.some(a=>a.currency==='USD');
-  const [editingRate, setEditingRate] = useState(false);
-  const [rateDraft, setRateDraft] = useState(exchangeRate);
-  const saveRate = () => { onSetExchangeRate(Number(rateDraft) || 0.92); setEditingRate(false); };
-  const accountName = (id) => { const a = accounts.find(x=>x.id===id); return a ? `${a.emoji} ${a.name}` : ''; };
-  const pocketsOf = (id) => accounts.filter(a=>a.parentAccountId===id);
-
-  const Card = ({ a }) => (
+// tarjeta de cuenta/pocket — de nivel superior para que no se remonte (y repita la animación de
+// entrada) cada vez que AccountsView vuelve a renderizar.
+function AccountCard({ a, accountName, exchangeRate, pocketCount, onOpen, onEdit, onDelete, onToggleInNet, onToggleActive, onAddPocket }) {
+  return (
     <div className={`bg-white dark:bg-ink-700 border ${a.parentAccountId ? 'border-dashed border-paper-300 dark:border-ink-500/50 ml-4' : 'border-paper-300 dark:border-ink-500/70'} rounded-2xl p-5 shadow-soft flex flex-col gap-3 animate-fadein ${!a.active && 'opacity-70'}`}>
       <div className="flex items-start justify-between gap-2">
         <button onClick={()=>onOpen(a)} className="flex items-center gap-3 min-w-0 text-left group">
@@ -4200,11 +4193,25 @@ function AccountsView({ accounts, netWorth, accountsInNet, onAdd, onEdit, onDele
 
       {!a.parentAccountId && (
         <button onClick={()=>onAddPocket(a.id)} className="text-xs text-gold-500 hover:underline text-left flex items-center gap-1">
-          <IPlus size={12}/> {pocketsOf(a.id).length>0 ? 'Añadir otro pocket' : 'Crear un pocket dentro de esta cuenta'}
+          <IPlus size={12}/> {pocketCount>0 ? 'Añadir otro pocket' : 'Crear un pocket dentro de esta cuenta'}
         </button>
       )}
     </div>
   );
+}
+
+function AccountsView({ accounts, netWorth, accountsInNet, onAdd, onEdit, onDelete, onToggleActive, onToggleInNet, onOpen, onAddPocket, debts, subs, fixed, exchangeRate, onSetExchangeRate }) {
+  // los pockets NO se muestran aquí sueltos — solo dentro del detalle de su cuenta madre
+  const active = accounts.filter(a=>a.active && !a.parentAccountId);
+  const inactive = accounts.filter(a=>!a.active && !a.parentAccountId);
+  const positives = accounts.filter(a=>a.active && a.includeInNet && a.balance>0).reduce((s,a)=>s+accountBalanceInEur(a, exchangeRate),0);
+  const negatives = accounts.filter(a=>a.active && a.includeInNet && a.balance<0).reduce((s,a)=>s+accountBalanceInEur(a, exchangeRate),0);
+  const hasUsd = accounts.some(a=>a.currency==='USD');
+  const [editingRate, setEditingRate] = useState(false);
+  const [rateDraft, setRateDraft] = useState(exchangeRate);
+  const saveRate = () => { onSetExchangeRate(Number(rateDraft) || 0.92); setEditingRate(false); };
+  const accountName = (id) => { const a = accounts.find(x=>x.id===id); return a ? `${a.emoji} ${a.name}` : ''; };
+  const pocketsOf = (id) => accounts.filter(a=>a.parentAccountId===id);
 
   return (
     <div className="flex flex-col gap-5">
@@ -4243,7 +4250,8 @@ function AccountsView({ accounts, netWorth, accountsInNet, onAdd, onEdit, onDele
         <div className="flex flex-col gap-3">
           <h3 className="font-medium text-ink-900 dark:text-gray-100">Activas</h3>
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {active.map(a => <Card key={a.id} a={a}/>)}
+            {active.map(a => <AccountCard key={a.id} a={a} accountName={accountName} exchangeRate={exchangeRate} pocketCount={pocketsOf(a.id).length}
+              onOpen={onOpen} onEdit={onEdit} onDelete={onDelete} onToggleInNet={onToggleInNet} onToggleActive={onToggleActive} onAddPocket={onAddPocket}/>)}
           </div>
         </div>
       )}
@@ -4251,7 +4259,8 @@ function AccountsView({ accounts, netWorth, accountsInNet, onAdd, onEdit, onDele
         <div className="flex flex-col gap-3 mt-2">
           <h3 className="font-medium text-ink-900 dark:text-gray-100">Desactivas</h3>
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {inactive.map(a => <Card key={a.id} a={a}/>)}
+            {inactive.map(a => <AccountCard key={a.id} a={a} accountName={accountName} exchangeRate={exchangeRate} pocketCount={pocketsOf(a.id).length}
+              onOpen={onOpen} onEdit={onEdit} onDelete={onDelete} onToggleInNet={onToggleInNet} onToggleActive={onToggleActive} onAddPocket={onAddPocket}/>)}
           </div>
         </div>
       )}
@@ -5394,6 +5403,22 @@ function Root() {
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(<Root/>);
+</script>
+<script>
+  // esperamos a que termine de cargar todo (incluido el script de Tailwind) y a un par de frames
+  // más para que ya haya pintado los estilos reales antes de quitar la pantalla de carga —
+  // así se evita el parpadeo de contenido sin estilo que se ve un instante al abrir la app.
+  window.addEventListener('load', function () {
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        var el = document.getElementById('__splash');
+        if (el) {
+          el.style.opacity = '0';
+          setTimeout(function () { el.remove(); }, 250);
+        }
+      });
+    });
+  });
 </script>
 </body>
 </html>
