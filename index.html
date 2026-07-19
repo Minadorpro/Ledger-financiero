@@ -3071,7 +3071,7 @@ function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDe
                     <Pie data={distribution} dataKey="value" nameKey="name" innerRadius={45} outerRadius={70} paddingAngle={3} stroke="none">
                       {distribution.map((d,i)=><Cell key={i} fill={d.color}/>)}
                     </Pie>
-                    <Tooltip formatter={(v)=>fmt(v)} contentStyle={{background:'#131722', border:'1px solid #262B38', borderRadius:8, fontSize:12}}/>
+                    <Tooltip formatter={(v)=>fmt(v)} contentStyle={{background:'#131722', border:'1px solid #262B38', borderRadius:8, fontSize:12}} itemStyle={{color:'#F5F1E8'}} labelStyle={{color:'#F5F1E8'}}/>
                   </PieChart>
                 </ResponsiveContainer>
               </div>
@@ -3931,11 +3931,30 @@ function MiniCollapsible({ title, count, children }) {
   );
 }
 
+// tarjeta resumen desplegable para el detalle de cuenta (Pagos, Gastos hormiga, Deudas vinculadas, etc.)
+// — de nivel superior para que no se remonte en cada render.
+function SectionBanner({ emoji, label, count, total, active, onClick }) {
+  return (
+    <button onClick={onClick}
+      className={`text-left bg-white dark:bg-ink-700 border rounded-2xl p-4 shadow-soft transition ${active ? 'border-gold-500' : 'border-paper-300 dark:border-ink-500/70 hover:border-gold-500/50'}`}>
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1.5 text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400 font-medium truncate">
+          <span className="text-sm shrink-0">{emoji}</span><span className="truncate">{label}</span>
+        </span>
+        <span className={`text-gray-400 shrink-0 transition-transform ${active ? 'rotate-90' : ''}`}><IChevR size={13}/></span>
+      </div>
+      <div className="font-mono text-lg font-semibold text-ink-900 dark:text-gray-100 mt-2">{fmt(total)}</div>
+      <div className="text-xs text-gray-500 mt-0.5">{count} {count===1 ? 'movimiento' : 'movimientos'}</div>
+    </button>
+  );
+}
+
 function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antExpenses, pocketPayments, transferList, duePayments, appliedPayments, debts, subs, fixed, projects, exchangeRate,
                          onEditSaving, onDeleteSaving, onEditIncome, onDeleteIncome, onEditAnt, onDeleteAnt, onEditPocketPayment, onDeletePocketPayment, onEditTransfer, onDeleteTransfer, onEditDebt, onDeleteDebt,
                          onEditSub, onDeleteSub, onEditFixed, onDeleteFixed, onCancelCharge, onAddPocket, onQuickTransfer, onQuickPocketPayment, onEditAccount, onDeleteAccount, onToggleAccountActive, onClose }) {
   const id = account.id;
   const [expandedPocketId, setExpandedPocketId] = useState(null);
+  const [expandedSection, setExpandedSection] = useState(null);
   const nameOf = (aid) => { const a = accounts.find(x=>x.id===aid); return a ? `${a.emoji} ${a.name}` : '—'; };
   const myPockets = accounts.filter(a => a.parentAccountId === id);
   const parentAccount = account.parentAccountId ? accounts.find(a=>a.id===account.parentAccountId) : null;
@@ -4113,126 +4132,114 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
 
       {hasNothing && <p className="text-sm text-gray-500 py-4 text-center">Esta cuenta todavía no tiene movimientos ni pagos vinculados.</p>}
 
-      {charged.length>0 && (
-        <MiniCollapsible title="Pagos realizados" count={charged.length}>
-          {charged.map(p => {
-            const real = appliedByKey[p.key] || 0;
-            return (
-              <div key={p.key} className="flex items-center gap-3 py-2.5 border-t border-paper-300/60 dark:border-ink-500/40">
-                <span className="text-xl shrink-0">{p.emoji}</span>
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm text-ink-900 dark:text-gray-100 truncate">{p.name}</div>
-                  <div className="text-xs text-gray-500 truncate">{fmtDate(p.date)} · {typeLabel[p.type]}</div>
+      {!hasNothing && (() => {
+        const pagosTotal = charged.reduce((s,p)=> s + Math.abs(appliedByKey[p.key]||0), 0);
+        const hormigaTotal = ants.reduce((s,e)=>s+e.amount,0);
+        const ahorroTotal = transfers.reduce((s,e)=>s+e.amount,0);
+        const deudasTotal = linkedDebts.reduce((s,d)=>s+(d.monthlyPayment||0),0);
+        const subsTotal = linkedSubs.reduce((s,x)=>s+effectiveSubValueNow(x),0);
+        const fixedTotal = linkedFixed.reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
+        const entradasTotal = incomes.reduce((s,e)=>s+e.amount,0);
+        const pocketPaysTotal = pocketPays.reduce((s,e)=>s+e.amount,0);
+        const transfersTotal = accTransfers.reduce((s,t)=>s+t.amount,0);
+        const toggle = (key) => setExpandedSection(s=>s===key?null:key);
+        return (
+        <>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+          {charged.length>0 && <SectionBanner emoji="🧾" label="Pagos realizados" count={charged.length} total={pagosTotal} active={expandedSection==='pagos'} onClick={()=>toggle('pagos')}/>}
+          {ants.length>0 && <SectionBanner emoji="🐜" label="Gastos hormiga" count={ants.length} total={hormigaTotal} active={expandedSection==='hormiga'} onClick={()=>toggle('hormiga')}/>}
+          {transfers.length>0 && <SectionBanner emoji="🐷" label="Aporte en ahorro" count={transfers.length} total={ahorroTotal} active={expandedSection==='ahorro'} onClick={()=>toggle('ahorro')}/>}
+          {linkedDebts.length>0 && <SectionBanner emoji="💳" label="Deudas vinculadas" count={linkedDebts.length} total={deudasTotal} active={expandedSection==='deudas'} onClick={()=>toggle('deudas')}/>}
+          {linkedSubs.length>0 && <SectionBanner emoji="🔁" label="Suscripciones vinculadas" count={linkedSubs.length} total={subsTotal} active={expandedSection==='subs'} onClick={()=>toggle('subs')}/>}
+          {linkedFixed.length>0 && <SectionBanner emoji="🏠" label="Gastos fijos vinculados" count={linkedFixed.length} total={fixedTotal} active={expandedSection==='fijos'} onClick={()=>toggle('fijos')}/>}
+          {incomes.length>0 && <SectionBanner emoji="💶" label="Entradas" count={incomes.length} total={entradasTotal} active={expandedSection==='entradas'} onClick={()=>toggle('entradas')}/>}
+          {pocketPays.length>0 && <SectionBanner emoji="💵" label="Pagos" count={pocketPays.length} total={pocketPaysTotal} active={expandedSection==='pocketpagos'} onClick={()=>toggle('pocketpagos')}/>}
+          {accTransfers.length>0 && <SectionBanner emoji="🔄" label="Transferencias entre cuentas" count={accTransfers.length} total={transfersTotal} active={expandedSection==='transfers'} onClick={()=>toggle('transfers')}/>}
+        </div>
+
+        {expandedSection && (
+          <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-4 shadow-soft flex flex-col divide-paper-300 dark:divide-ink-500/40">
+            {expandedSection==='pagos' && charged.map(p => {
+              const real = appliedByKey[p.key] || 0;
+              return (
+                <div key={p.key} className="flex items-center gap-3 py-2.5 border-t border-paper-300/60 dark:border-ink-500/40 first:border-t-0">
+                  <span className="text-xl shrink-0">{p.emoji}</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm text-ink-900 dark:text-gray-100 truncate">{p.name}</div>
+                    <div className="text-xs text-gray-500 truncate">{fmtDate(p.date)} · {typeLabel[p.type]}</div>
+                  </div>
+                  <span className="font-mono text-sm shrink-0 text-red-400">−{fmt(Math.abs(real))}</span>
+                  {real>0 ? (
+                    <button onClick={()=>onCancelCharge({ key:p.key, accountId:id, amount:real, name:`${p.name} · ${fmtDate(p.date)}` })}
+                      className="text-xs text-gray-500 hover:text-red-400 underline decoration-dotted transition shrink-0">Cancelar</button>
+                  ) : <div className="w-[62px] shrink-0"/>}
                 </div>
-                <span className="font-mono text-sm shrink-0 text-red-400">−{fmt(Math.abs(real))}</span>
-                {real>0 ? (
-                  <button onClick={()=>onCancelCharge({ key:p.key, accountId:id, amount:real, name:`${p.name} · ${fmtDate(p.date)}` })}
-                    className="text-xs text-gray-500 hover:text-red-400 underline decoration-dotted transition shrink-0">Cancelar</button>
-                ) : <div className="w-[62px] shrink-0"/>}
-              </div>
-            );
-          })}
-        </MiniCollapsible>
-      )}
-
-      {incomes.length>0 && (
-        <MiniCollapsible title="Entradas" count={incomes.length}>
-          {incomes.map(e => (
-            <Row key={e.id} emoji="💶" title={e.note || e.category || 'Entrada'}
-              subtitle={`${e.date}${e.category ? ` · ${e.category}` : ''}`}
-              amount={e.amount} positive={true}
-              onEdit={()=>onEditIncome(e)} onDelete={()=>onDeleteIncome(e)}/>
-          ))}
-        </MiniCollapsible>
-      )}
-
-      {ants.length>0 && (
-        <MiniCollapsible title="Gastos hormiga" count={ants.length}>
-          {ants.map(e => (
-            <Row key={e.id} emoji="🐜" title={e.note || e.category || 'Gasto hormiga'}
-              subtitle={`${fmtDate(e.date)}${e.category ? ` · ${e.category}` : ''}`}
-              amount={e.amount} positive={false}
-              onEdit={()=>onEditAnt(e)} onDelete={()=>onDeleteAnt(e)}/>
-          ))}
-        </MiniCollapsible>
-      )}
-
-      {pocketPays.length>0 && (
-        <MiniCollapsible title="Pagos" count={pocketPays.length}>
-          {pocketPays.map(e => (
-            <Row key={e.id} emoji="💳" title={e.note || 'Pago'}
-              subtitle={fmtDate(e.date)}
-              amount={e.amount} positive={false}
-              onEdit={()=>onEditPocketPayment(e)} onDelete={()=>onDeletePocketPayment(e)}/>
-          ))}
-        </MiniCollapsible>
-      )}
-
-      {accTransfers.length>0 && (
-        <MiniCollapsible title="Transferencias entre cuentas" count={accTransfers.length}>
-          {accTransfers.map(t => {
-            const incoming = t.toAccountId === id;
-            const other = incoming ? t.fromAccountId : t.toAccountId;
-            return (
-              <Row key={t.id} emoji="🔄"
-                title={incoming ? `Entró desde ${nameOf(other)}` : `Salió hacia ${nameOf(other)}`}
-                subtitle={`${fmtDate(t.date)}${t.note ? ` · ${t.note}` : ''}`}
-                amount={t.amount} positive={incoming}
-                onEdit={()=>onEditTransfer(t)} onDelete={()=>onDeleteTransfer(t)}/>
-            );
-          })}
-        </MiniCollapsible>
-      )}
-
-      {transfers.length>0 && (
-        <MiniCollapsible title="Aportes a ahorro" count={transfers.length}>
-          {transfers.map(e => {
-            const incoming = e.toAccountId === id;
-            const other = incoming ? e.fromAccountId : e.toAccountId;
-            const project = projects.find(p=>p.id===e.projectId);
-            return (
-              <Row key={e.id} emoji={project ? project.emoji : '💶'}
-                title={incoming ? `Entró desde ${nameOf(other)}` : `Salió hacia ${nameOf(other)}`}
-                subtitle={`${e.date}${project ? ` · ${project.name}` : ''}${e.note ? ` · ${e.note}` : ''}`}
-                amount={e.amount} positive={incoming}
-                onEdit={()=>onEditSaving(e)} onDelete={()=>onDeleteSaving(e)}/>
-            );
-          })}
-        </MiniCollapsible>
-      )}
-
-      {linkedDebts.length>0 && (
-        <MiniCollapsible title="Deudas vinculadas" count={linkedDebts.length}>
-          {linkedDebts.map(d => (
-            <Row key={d.id} emoji={d.emoji} title={d.name}
-              subtitle={`Día ${d.paymentDay} de cada mes · ${d.mode==='auto'?'Automático':'Manual'}`}
-              amount={d.monthlyPayment} positive={false}
-              onEdit={()=>onEditDebt(d)} onDelete={()=>onDeleteDebt(d)}/>
-          ))}
-        </MiniCollapsible>
-      )}
-
-      {linkedSubs.length>0 && (
-        <MiniCollapsible title="Suscripciones vinculadas" count={linkedSubs.length}>
-          {linkedSubs.map(s => (
-            <Row key={s.id} emoji={s.emoji} title={s.name}
-              subtitle={`${s.frequency==='annual' ? 'Anual' : `Mensual, día ${s.billingDay}`}${!s.active ? ' · Cancelada' : ''}`}
-              amount={effectiveSubValueNow(s)} positive={false}
-              onEdit={()=>onEditSub(s)} onDelete={()=>onDeleteSub(s)}/>
-          ))}
-        </MiniCollapsible>
-      )}
-
-      {linkedFixed.length>0 && (
-        <MiniCollapsible title="Gastos fijos vinculados" count={linkedFixed.length}>
-          {linkedFixed.map(f => (
-            <Row key={f.id} emoji={f.emoji} title={f.name}
-              subtitle={f.paymentDay ? `Día ${f.paymentDay} de cada mes` : 'Sin día fijo'}
-              amount={effectiveMonthlyValueNow(f)} positive={false}
-              onEdit={()=>onEditFixed(f)} onDelete={()=>onDeleteFixed(f)}/>
-          ))}
-        </MiniCollapsible>
-      )}
+              );
+            })}
+            {expandedSection==='entradas' && incomes.map(e => (
+              <Row key={e.id} emoji="💶" title={e.note || e.category || 'Entrada'}
+                subtitle={`${e.date}${e.category ? ` · ${e.category}` : ''}`}
+                amount={e.amount} positive={true}
+                onEdit={()=>onEditIncome(e)} onDelete={()=>onDeleteIncome(e)}/>
+            ))}
+            {expandedSection==='hormiga' && ants.map(e => (
+              <Row key={e.id} emoji="🐜" title={e.note || e.category || 'Gasto hormiga'}
+                subtitle={`${fmtDate(e.date)}${e.category ? ` · ${e.category}` : ''}`}
+                amount={e.amount} positive={false}
+                onEdit={()=>onEditAnt(e)} onDelete={()=>onDeleteAnt(e)}/>
+            ))}
+            {expandedSection==='pocketpagos' && pocketPays.map(e => (
+              <Row key={e.id} emoji="💳" title={e.note || 'Pago'}
+                subtitle={fmtDate(e.date)}
+                amount={e.amount} positive={false}
+                onEdit={()=>onEditPocketPayment(e)} onDelete={()=>onDeletePocketPayment(e)}/>
+            ))}
+            {expandedSection==='transfers' && accTransfers.map(t => {
+              const incoming = t.toAccountId === id;
+              const other = incoming ? t.fromAccountId : t.toAccountId;
+              return (
+                <Row key={t.id} emoji="🔄"
+                  title={incoming ? `Entró desde ${nameOf(other)}` : `Salió hacia ${nameOf(other)}`}
+                  subtitle={`${fmtDate(t.date)}${t.note ? ` · ${t.note}` : ''}`}
+                  amount={t.amount} positive={incoming}
+                  onEdit={()=>onEditTransfer(t)} onDelete={()=>onDeleteTransfer(t)}/>
+              );
+            })}
+            {expandedSection==='ahorro' && transfers.map(e => {
+              const incoming = e.toAccountId === id;
+              const other = incoming ? e.fromAccountId : e.toAccountId;
+              const project = projects.find(p=>p.id===e.projectId);
+              return (
+                <Row key={e.id} emoji={project ? project.emoji : '💶'}
+                  title={incoming ? `Entró desde ${nameOf(other)}` : `Salió hacia ${nameOf(other)}`}
+                  subtitle={`${e.date}${project ? ` · ${project.name}` : ''}${e.note ? ` · ${e.note}` : ''}`}
+                  amount={e.amount} positive={incoming}
+                  onEdit={()=>onEditSaving(e)} onDelete={()=>onDeleteSaving(e)}/>
+              );
+            })}
+            {expandedSection==='deudas' && linkedDebts.map(d => (
+              <Row key={d.id} emoji={d.emoji} title={d.name}
+                subtitle={`Día ${d.paymentDay} de cada mes · ${d.mode==='auto'?'Automático':'Manual'}`}
+                amount={d.monthlyPayment} positive={false}
+                onEdit={()=>onEditDebt(d)} onDelete={()=>onDeleteDebt(d)}/>
+            ))}
+            {expandedSection==='subs' && linkedSubs.map(s => (
+              <Row key={s.id} emoji={s.emoji} title={s.name}
+                subtitle={`${s.frequency==='annual' ? 'Anual' : `Mensual, día ${s.billingDay}`}${!s.active ? ' · Cancelada' : ''}`}
+                amount={effectiveSubValueNow(s)} positive={false}
+                onEdit={()=>onEditSub(s)} onDelete={()=>onDeleteSub(s)}/>
+            ))}
+            {expandedSection==='fijos' && linkedFixed.map(f => (
+              <Row key={f.id} emoji={f.emoji} title={f.name}
+                subtitle={f.paymentDay ? `Día ${f.paymentDay} de cada mes` : 'Sin día fijo'}
+                amount={effectiveMonthlyValueNow(f)} positive={false}
+                onEdit={()=>onEditFixed(f)} onDelete={()=>onDeleteFixed(f)}/>
+            ))}
+          </div>
+        )}
+        </>
+        );
+      })()}
 
       <div className="flex justify-start mt-2">
         <button onClick={onClose} className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-paper-200 dark:hover:bg-ink-600 transition"><IChevL size={15}/> Volver a cuentas</button>
@@ -4740,23 +4747,35 @@ function AntExpensesView({ entries, thisMonth, thisYear, budget, onSetBudget, on
 /* =========================================================================
    REPARTO DE INGRESOS (por porcentaje) + SALUD FINANCIERA
    ========================================================================= */
-function ToggleRow({ emoji, name, amount, active, onToggle }) {
+function ToggleRow({ emoji, name, amount, active, onToggle, usedElsewhere, usedByName }) {
+  const blocked = usedElsewhere && !active;
   return (
     <div className="flex items-center gap-3 py-2 border-t border-paper-300/60 dark:border-ink-500/40">
       <span className="text-lg shrink-0">{emoji}</span>
-      <div className="flex-1 min-w-0 text-sm text-ink-900 dark:text-gray-100 truncate">{name}</div>
+      <div className="flex-1 min-w-0 text-sm text-ink-900 dark:text-gray-100 truncate">
+        {name}
+        {blocked && <span className="block text-[11px] text-gray-500 truncate">Ya está en "{usedByName}"</span>}
+      </div>
       {amount!=null && <span className="font-mono text-xs text-gray-500 shrink-0">{fmt(amount)}</span>}
-      <button onClick={onToggle} className={`shrink-0 w-7 h-7 rounded-lg flex items-center justify-center transition ${active ? 'bg-gold-500 text-ink-900' : 'bg-paper-200 dark:bg-ink-600 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'}`}>
-        <ICheck size={14}/>
+      <button onClick={blocked ? undefined : onToggle} disabled={blocked} title={blocked ? `Ya está cubierto por "${usedByName}"` : undefined}
+        className={`shrink-0 w-7 h-7 rounded-lg flex items-center justify-center transition ${
+          blocked ? 'bg-paper-200 dark:bg-ink-600 text-gray-400 cursor-not-allowed'
+          : active ? 'bg-gold-500 text-ink-900' : 'bg-paper-200 dark:bg-ink-600 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'}`}>
+        {blocked ? <IX size={13}/> : <ICheck size={14}/>}
       </button>
     </div>
   );
 }
 
-function RuleCard({ r, totalIncome, accountName, debts, subs, fixed, antBudget, savingsBudget, antThisMonth, expanded, onToggleExpand, onEdit, onDelete, onToggleLinkedItem }) {
+function RuleCard({ r, allRules, totalIncome, accountName, debts, subs, fixed, antBudget, savingsBudget, antThisMonth, expanded, onToggleExpand, onEdit, onDelete, onToggleLinkedItem }) {
   const linked = r.linkedItems || [];
   const isLinked = (type, id) => linked.some(li => li.type===type && (id===undefined ? true : li.id===id));
   const monthlySub = (s) => s.frequency==='annual' ? effectiveSubValueNow(s)/12 : effectiveSubValueNow(s);
+  // ¿esto ya está elegido en OTRO reparto? (para no cubrirlo dos veces por accidente)
+  const usedElsewhere = (type, id) => {
+    const other = (allRules||[]).find(other => other.id!==r.id && (other.linkedItems||[]).some(li => li.type===type && (id===undefined ? true : li.id===id)));
+    return other ? other.name : null;
+  };
 
   const linkedSum = useMemo(() => linked.reduce((sum, li) => {
     if (li.type==='ants') return sum + (antBudget||0);
@@ -4816,21 +4835,26 @@ function RuleCard({ r, totalIncome, accountName, debts, subs, fixed, antBudget, 
           <p className="text-xs text-gray-500">Activa lo que quieras cubrir con esta parte del reparto — solo es para calcular cuánto necesitas destinarle, no mueve nada.</p>
           <MiniCollapsible title="Deudas" count={debts.length}>
             {debts.map(d => (
-              <ToggleRow key={d.id} emoji={d.emoji} name={d.name} amount={d.monthlyPayment} active={isLinked('debt', d.id)} onToggle={()=>onToggleLinkedItem(r.id, 'debt', d.id)}/>
+              <ToggleRow key={d.id} emoji={d.emoji} name={d.name} amount={d.monthlyPayment} active={isLinked('debt', d.id)} onToggle={()=>onToggleLinkedItem(r.id, 'debt', d.id)}
+                usedElsewhere={!!usedElsewhere('debt', d.id)} usedByName={usedElsewhere('debt', d.id)}/>
             ))}
           </MiniCollapsible>
           <MiniCollapsible title="Suscripciones" count={subs.length}>
             {subs.map(s => (
-              <ToggleRow key={s.id} emoji={s.emoji} name={s.name} amount={monthlySub(s)} active={isLinked('sub', s.id)} onToggle={()=>onToggleLinkedItem(r.id, 'sub', s.id)}/>
+              <ToggleRow key={s.id} emoji={s.emoji} name={s.name} amount={monthlySub(s)} active={isLinked('sub', s.id)} onToggle={()=>onToggleLinkedItem(r.id, 'sub', s.id)}
+                usedElsewhere={!!usedElsewhere('sub', s.id)} usedByName={usedElsewhere('sub', s.id)}/>
             ))}
           </MiniCollapsible>
           <MiniCollapsible title="Gastos fijos" count={fixed.length}>
             {fixed.map(f => (
-              <ToggleRow key={f.id} emoji={f.emoji} name={f.name} amount={effectiveMonthlyValueNow(f)} active={isLinked('fixed', f.id)} onToggle={()=>onToggleLinkedItem(r.id, 'fixed', f.id)}/>
+              <ToggleRow key={f.id} emoji={f.emoji} name={f.name} amount={effectiveMonthlyValueNow(f)} active={isLinked('fixed', f.id)} onToggle={()=>onToggleLinkedItem(r.id, 'fixed', f.id)}
+                usedElsewhere={!!usedElsewhere('fixed', f.id)} usedByName={usedElsewhere('fixed', f.id)}/>
             ))}
           </MiniCollapsible>
-          <ToggleRow emoji="🐜" name={`Gastos hormiga (${fmt(antBudget||0)}/mes)`} amount={null} active={isLinked('ants')} onToggle={()=>onToggleLinkedItem(r.id, 'ants')}/>
-          <ToggleRow emoji="🐷" name={`Ahorro (${fmt(savingsBudget||0)}/mes)`} amount={null} active={isLinked('savings')} onToggle={()=>onToggleLinkedItem(r.id, 'savings')}/>
+          <ToggleRow emoji="🐜" name={`Gastos hormiga (${fmt(antBudget||0)}/mes)`} amount={null} active={isLinked('ants')} onToggle={()=>onToggleLinkedItem(r.id, 'ants')}
+            usedElsewhere={!!usedElsewhere('ants')} usedByName={usedElsewhere('ants')}/>
+          <ToggleRow emoji="🐷" name={`Ahorro (${fmt(savingsBudget||0)}/mes)`} amount={null} active={isLinked('savings')} onToggle={()=>onToggleLinkedItem(r.id, 'savings')}
+            usedElsewhere={!!usedElsewhere('savings')} usedByName={usedElsewhere('savings')}/>
         </div>
       )}
     </div>
@@ -4936,7 +4960,7 @@ function SplitView({ rules, accounts, incomeAuto, salaryOverride, salaryForSplit
         <div className="grid lg:grid-cols-5 gap-4">
           <div className="lg:col-span-3 flex flex-col gap-3">
             {rules.map(r => (
-              <RuleCard key={r.id} r={r} totalIncome={totalIncome} accountName={accountName}
+              <RuleCard key={r.id} r={r} allRules={rules} totalIncome={totalIncome} accountName={accountName}
                 debts={debts} subs={subs} fixed={fixed} antBudget={antBudget} savingsBudget={savingsBudget} antThisMonth={antThisMonth}
                 expanded={expandedRuleId===r.id} onToggleExpand={()=>setExpandedRuleId(id=>id===r.id?null:r.id)}
                 onEdit={onEdit} onDelete={onDelete} onToggleLinkedItem={onToggleLinkedItem}/>
@@ -4951,7 +4975,7 @@ function SplitView({ rules, accounts, incomeAuto, salaryOverride, salaryForSplit
                       <Pie data={distribution} dataKey="value" nameKey="name" innerRadius={50} outerRadius={80} paddingAngle={3} stroke="none">
                         {distribution.map((d,i)=><Cell key={i} fill={d.color}/>)}
                       </Pie>
-                      <Tooltip formatter={(v)=>fmt(v)} contentStyle={{background:'#131722', border:'1px solid #262B38', borderRadius:8, fontSize:12}}/>
+                      <Tooltip formatter={(v)=>fmt(v)} contentStyle={{background:'#131722', border:'1px solid #262B38', borderRadius:8, fontSize:12}} itemStyle={{color:'#F5F1E8'}} labelStyle={{color:'#F5F1E8'}}/>
                     </PieChart>
                   </ResponsiveContainer>
                 </div>
@@ -5216,7 +5240,7 @@ function StatsView({ distribution, projection, totalCommitted, totalDebtMonthly,
               <CartesianGrid strokeDasharray="3 3" stroke="#262B38" vertical={false}/>
               <XAxis dataKey="mes" stroke="#6B7280" fontSize={11} tickLine={false} axisLine={false}/>
               <YAxis stroke="#6B7280" fontSize={11} tickLine={false} axisLine={false}/>
-              <Tooltip formatter={(v)=>fmt(v)} contentStyle={{background:'#131722', border:'1px solid #262B38', borderRadius:8, fontSize:12}}/>
+              <Tooltip formatter={(v)=>fmt(v)} contentStyle={{background:'#131722', border:'1px solid #262B38', borderRadius:8, fontSize:12}} itemStyle={{color:'#F5F1E8'}} labelStyle={{color:'#F5F1E8'}}/>
               <Bar dataKey="total" radius={[4,4,0,0]} fill={COLORS.gold}/>
             </BarChart>
           </ResponsiveContainer>
