@@ -102,7 +102,7 @@
 const { useState, useEffect, useMemo, useRef, useCallback } = React;
 const {
   PieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend,
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, LineChart, Line,
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, LineChart, Line, ReferenceLine,
 } = Recharts;
 
 /* =========================================================================
@@ -1130,11 +1130,11 @@ function SubscriptionForm({ initial, accounts, onSave, onClose }) {
   const isAnnual = f.frequency === 'annual';
   const submit = (e) => {
     e.preventDefault();
-    if (!f.name || (isAnnual ? !f.annualPrice : !f.monthlyPrice)) return;
+    if (!f.name || (isAnnual ? (f.annualPrice==='' || f.annualPrice==null) : (f.monthlyPrice==='' || f.monthlyPrice==null))) return;
     onSave({
       ...f,
-      monthlyPrice: f.monthlyPrice ? Number(f.monthlyPrice) : null,
-      annualPrice: f.annualPrice ? Number(f.annualPrice) : null,
+      monthlyPrice: f.monthlyPrice!=='' && f.monthlyPrice!=null ? Number(f.monthlyPrice) : null,
+      annualPrice: f.annualPrice!=='' && f.annualPrice!=null ? Number(f.annualPrice) : null,
       billingDay: Number(f.billingDay) || 1,
     });
   };
@@ -1219,7 +1219,7 @@ function FixedForm({ initial, accounts, onSave, onClose }) {
   const set = (k,v) => setF(s=>({...s,[k]:v}));
   const submit = (e) => {
     e.preventDefault();
-    if (!f.name || !f.monthlyValue) return;
+    if (!f.name || f.monthlyValue==='' || f.monthlyValue==null) return;
     onSave({ ...f, monthlyValue:Number(f.monthlyValue), paymentDay: f.noPaymentDay ? null : Number(f.paymentDay), essential: f.essential !== false });
   };
   return (
@@ -1284,12 +1284,12 @@ function FixedForm({ initial, accounts, onSave, onClose }) {
 }
 
 function SavingsProjectForm({ initial, accounts, onSave, onClose }) {
-  const [f, setF] = useState(initial || { name:'', emoji:'🎯', targetAmount:'', accountId:'' });
+  const [f, setF] = useState(initial || { name:'', emoji:'🎯', targetAmount:'', accountId:'', minFloor:'' });
   const set = (k,v) => setF(s=>({...s,[k]:v}));
   const submit = (e) => {
     e.preventDefault();
     if (!f.name) return;
-    onSave({ ...f, targetAmount: f.targetAmount ? Number(f.targetAmount) : null, accountId: f.accountId || null });
+    onSave({ ...f, targetAmount: f.targetAmount ? Number(f.targetAmount) : null, accountId: f.accountId || null, minFloor: f.minFloor ? Number(f.minFloor) : null });
   };
   return (
     <form onSubmit={submit} className="flex flex-col gap-4">
@@ -1303,6 +1303,10 @@ function SavingsProjectForm({ initial, accounts, onSave, onClose }) {
       </div>
       <Field label="Meta de ahorro (€, opcional)">
         <input type="number" step="0.01" className={inputCls} value={f.targetAmount} onChange={e=>set('targetAmount', e.target.value)} placeholder="Deja vacío si no tienes una meta fija"/>
+      </Field>
+      <Field label="No dejar que baje de (€, opcional)">
+        <input type="number" step="0.01" className={inputCls} value={f.minFloor} onChange={e=>set('minFloor', e.target.value)} placeholder="Ej. 1500"/>
+        <p className="text-xs text-gray-500 mt-1.5">Si lo ahorrado de este proyecto cae por debajo de este monto, te avisamos — no bloquea ningún retiro, solo alerta.</p>
       </Field>
       <Field label="Cuenta vinculada (opcional)">
         <select className={inputCls} value={f.accountId||''} onChange={e=>set('accountId', e.target.value)}>
@@ -1791,6 +1795,10 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const [salaryOverrides, setSalaryOverrides] = useState({}); // { "2026-07": 1200 } — sueldo puesto a mano ese mes, para el Reparto
   const [exchangeRate, setExchangeRate] = useState(0.92); // cuántos EUR vale 1 USD — lo actualizas tú manualmente
   const [expectedIncome, setExpectedIncome] = useState(0);
+  // ingreso SIMULADO por mes (clave "YYYY-MM") — para meses donde todavía no te han pagado. No
+  // afecta entradas reales, flujo, ni ahorro: solo se usa para calcular el % comprometido de ese
+  // mes en el gráfico y en la alerta del 45%, hasta que pongas el ingreso real.
+  const [simulatedIncome, setSimulatedIncome] = useState({});
   const [accounts, setAccounts] = useState([]);
   const [accountsInit, setAccountsInit] = useState(false);
   const [transfers, setTransfers] = useState([]);
@@ -1844,6 +1852,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       setSalaryOverrides(d.salaryOverrides || {});
       setExchangeRate(d.exchangeRate || 0.92);
       setExpectedIncome(d.expectedIncome || 0);
+      setSimulatedIncome(d.simulatedIncome || {});
       // migración puntual SOLO para el dueño de la app: sus cuentas ya existían antes de esta sección.
       // cualquier otro usuario empieza con la lista vacía y crea las suyas.
       const needsAccounts = isOwner && !d.accountsInit && (!d.accounts || d.accounts.length === 0);
@@ -1882,16 +1891,16 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     return saveChainRef.current;
   };
   useEffect(() => {
-    latestSnapshotRef.current = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate };
+    latestSnapshotRef.current = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, simulatedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate };
   });
   useEffect(() => {
     if (!loaded) return;
     const t = setTimeout(() => {
-      const payload = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate };
+      const payload = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, simulatedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate };
       enqueueSave(payload);
     }, 150);
     return () => clearTimeout(t);
-  }, [debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate, loaded, store]);
+  }, [debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, simulatedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate, loaded, store]);
 
   // descarga un archivo .json con TODOS los datos tal como están ahora mismo — una copia de
   // seguridad tuya, en tu computadora, que no depende de mí ni de Firebase.
@@ -2363,6 +2372,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const out = [];
     const now = new Date();
     const curIdx = now.getFullYear()*12 + now.getMonth();
+    const today = todayISO();
 
     debts.forEach(d => {
       if (!d.accountId || d.finished) return;
@@ -2371,8 +2381,12 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       for (let idx = firstIdx; idx <= curIdx; idx++) {
         const y = Math.floor(idx/12), m = idx%12;
         if (isDebtPaidForOccurrence(d, y, m)) {
+          // "recién marcado hoy": para deudas con cuotas mira lastInstallmentMarkedAt, para las de
+          // saldo (sin fecha límite) mira lastPaid — es la señal de que ESTA acción se hizo ahora
+          // mismo, así que debe mover dinero ya, aunque la fecha de cobro del calendario ya haya pasado.
+          const justMarked = idx===curIdx && ((d.noEndDate ? d.lastPaid : d.lastInstallmentMarkedAt) === today);
           out.push({ key:`debt:${d.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:d.accountId, amount:d.monthlyPayment,
-                     type:'debt', name:d.name, emoji:d.emoji, date:new Date(y, m, clampDay(effectiveDay(d,y,m,d.paymentDay),y,m)) });
+                     type:'debt', name:d.name, emoji:d.emoji, date:new Date(y, m, clampDay(effectiveDay(d,y,m,d.paymentDay),y,m)), justMarked });
         }
       }
     });
@@ -2385,8 +2399,9 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         const y = Math.floor(idx/12), m = idx%12;
         const day = clampDay(effectiveDay(s,y,m,s.billingDay), y, m);
         if (isRecurringPaidForOccurrence(s, y, m, day)) {
+          const justMarked = idx===curIdx && s.lastPaid === today;
           out.push({ key:`sub:${s.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:s.accountId, amount:effectiveSubValue(s,y,m),
-                     type:'sub', name:s.name, emoji:s.emoji, date:new Date(y, m, day) });
+                     type:'sub', name:s.name, emoji:s.emoji, date:new Date(y, m, day), justMarked });
         }
       }
     });
@@ -2398,8 +2413,9 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       for (let idx = startIdx; idx <= curIdx; idx++) {
         const y = Math.floor(idx/12), m = idx%12;
         if (isFixedPaidForMonth(f, y, m)) {
+          const justMarked = idx===curIdx && f.lastPaid === today;
           out.push({ key:`fixed:${f.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:f.accountId, amount:effectiveMonthlyValue(f,y,m),
-                     type:'fixed', name:f.name, emoji:f.emoji, date:new Date(y, m, clampDay(effectiveDay(f,y,m,f.paymentDay),y,m)) });
+                     type:'fixed', name:f.name, emoji:f.emoji, date:new Date(y, m, clampDay(effectiveDay(f,y,m,f.paymentDay),y,m)), justMarked });
         }
       }
     });
@@ -2420,7 +2436,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
 
     // normalizamos por si vienen guardados como texto de una versión anterior
     const applied = appliedPayments.map(p => typeof p === 'string' ? { key:p, accountId:null, amount:0 } : p);
-    const appliedKeys = new Set(applied.map(p=>p.key));
+    const appliedByKey = new Map(applied.map(p=>[p.key, p]));
     const dueKeys = new Set(duePayments.map(p=>p.key));
 
     // corte: solo las ocurrencias de AYER en adelante mueven saldo de verdad.
@@ -2430,11 +2446,19 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     // desde ayer hacia adelante, igual que ya se hace con la primera cuenta usada (N26).
     const cutoff = yesterdayStart();
 
-    // pagos nuevos → se descuentan de la cuenta, pero solo si su fecha es de ayer en adelante;
-    // los meses anteriores a eso quedan registrados como ya aplicados sin tocar el saldo (amount 0)
+    // pagos nuevos → se descuentan de la cuenta, pero solo si su fecha es de ayer en adelante (o si
+    // se acaban de marcar pagados ahora mismo); los meses anteriores a eso quedan registrados como
+    // ya aplicados sin tocar el saldo (amount 0). También reprocesamos una clave que YA estaba
+    // registrada en 0€ si se acaba de volver a marcar pagada ahora — si no, una vez que un mes queda
+    // "fotografiado" en 0 (por ejemplo, la primera vez que se vinculó la cuenta) se quedaría
+    // congelado ahí para siempre, aunque después la marques pagada de verdad.
     const nuevos = duePayments
-      .filter(p => !appliedKeys.has(p.key))
-      .map(p => ({ ...p, appliedAmount: p.date < cutoff ? 0 : p.amount }));
+      .filter(p => {
+        const existing = appliedByKey.get(p.key);
+        return !existing || (existing.amount === 0 && p.justMarked);
+      })
+      .map(p => ({ ...p, appliedAmount: (p.date < cutoff && !p.justMarked) ? 0 : p.amount }));
+    const nuevosKeys = new Set(nuevos.map(p=>p.key));
     // pagos deshechos → se devuelve a la cuenta exactamente lo que se le había descontado
     const revertidos = applied.filter(p => !dueKeys.has(p.key) && p.amount > 0 && p.accountId);
 
@@ -2454,7 +2478,8 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       // historial y, al volver a vincular, se re-evalúan como si fueran pagos nuevos — con la
       // mala suerte de que si ese re-cálculo no llega a guardarse a tiempo antes de recargar la
       // página, la próxima carga las trata otra vez como pendientes y sí las descuenta todas.
-      ...applied.filter(p => p.amount === 0 || dueKeys.has(p.key)),
+      // (excepto las que estamos reemplazando justo ahora en "nuevos")
+      ...applied.filter(p => !nuevosKeys.has(p.key) && (p.amount === 0 || dueKeys.has(p.key))),
       ...nuevos.map(p => ({ key:p.key, accountId:p.accountId, amount:p.appliedAmount })),
     ]);
   }, [loaded, duePayments, appliedPayments]);
@@ -2569,6 +2594,16 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       return null;
     }).filter(Boolean);
   }, [upcoming, accounts, exchangeRate]);
+
+  // % de tus ingresos que ya está comprometido este mes (deudas+subs+fijos+hormiga) — si aún no
+  // hay ingreso real este mes, usa el simulado (si pusiste uno) solo para este cálculo.
+  const committedPctThisMonth = useMemo(() => {
+    const now = new Date();
+    const curKey = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+    const effectiveIncome = incomeThisMonth>0 ? incomeThisMonth : ((simulatedIncome||{})[curKey] || 0);
+    if (effectiveIncome<=0) return null;
+    return { pct: Math.round(((totalCommitted+antThisMonth)/effectiveIncome)*1000)/10, isSimulated: incomeThisMonth<=0 };
+  }, [incomeThisMonth, totalCommitted, antThisMonth, simulatedIncome]);
 
   // los recordatorios solo tienen sentido para lo que pagas tú manualmente y aún no has marcado como pagado
   const reminders = useMemo(()=> upcoming.filter(u=>u.daysUntil<=3 && u.mode!=='auto' && !u.paidThisCycle).map(u=>{
@@ -2764,7 +2799,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                   incomeThisMonth={incomeThisMonth} antThisMonth={antThisMonth} netFlowThisMonth={netFlowThisMonth}
                   hasIncomeData={incomeEntries.length>0}
                   netWorth={netWorth} hasAccounts={accounts.length>0}
-                  paymentStreak={paymentStreak} committedTrend={committedTrend} balanceAlerts={balanceAlerts}
+                  paymentStreak={paymentStreak} committedTrend={committedTrend} balanceAlerts={balanceAlerts} committedPctThisMonth={committedPctThisMonth}
                 />
               )}
               {view==='accounts' && (
@@ -2840,6 +2875,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                 <IncomeView entries={incomeEntries} thisMonth={incomeThisMonth} thisYear={incomeThisYear}
                   expected={expectedIncome} onSetExpected={setExpectedIncome}
                   totalCommitted={totalCommitted} antThisMonth={antThisMonth} antExpenses={antExpenses}
+                  simulatedIncome={simulatedIncome} onSetSimulatedIncome={(key,v)=>setSimulatedIncome(s=>({...s,[key]:v}))}
                   onAdd={()=>setModal({type:'income'})} onEdit={(e)=>setModal({type:'income', item:e})}
                   onDelete={(e)=>setConfirmDel({type:'income', id:e.id, name:fmt(e.amount)})}/>
               )}
@@ -2981,7 +3017,7 @@ function AddButton({ view, onAdd }) {
 /* =========================================================================
    DASHBOARD
    ========================================================================= */
-function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDebtPending, totalSubMonthly, totalFixedMonthly, totalSaved, savedThisMonth, monthsToFreedom, freedomDate, distribution, upcoming, reminders, activeDebtsCount, incomeThisMonth, antThisMonth, netFlowThisMonth, hasIncomeData, netWorth, hasAccounts, paymentStreak, committedTrend, balanceAlerts }) {
+function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDebtPending, totalSubMonthly, totalFixedMonthly, totalSaved, savedThisMonth, monthsToFreedom, freedomDate, distribution, upcoming, reminders, activeDebtsCount, incomeThisMonth, antThisMonth, netFlowThisMonth, hasIncomeData, netWorth, hasAccounts, paymentStreak, committedTrend, balanceAlerts, committedPctThisMonth }) {
   return (
     <div className="flex flex-col gap-6">
       {reminders.length>0 && (
@@ -2999,6 +3035,16 @@ function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDe
               <span className="font-medium">{a.name}</span>: tiene {fmt(a.available)} pero le tocan {fmt(a.needed)} esta semana — faltarían {fmt(a.shortfall)}.
             </div>
           ))}
+        </div>
+      )}
+
+      {committedPctThisMonth!==null && committedPctThisMonth.pct>45 && (
+        <div className="flex items-center gap-3 bg-red-500/10 border border-red-500/30 rounded-2xl p-4 animate-fadein">
+          <span className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0 bg-red-500/20 text-red-400"><IBell size={17}/></span>
+          <div>
+            <div className="font-medium text-ink-900 dark:text-gray-100">Lo comprometido es el {committedPctThisMonth.pct}% de tu ingreso {committedPctThisMonth.isSimulated ? 'simulado' : ''} este mes</div>
+            <div className="text-gray-500 dark:text-gray-500 text-xs mt-0.5">Por encima del 45% recomendado{committedPctThisMonth.isSimulated ? ' — esto es una simulación, se recalcula cuando pongas el ingreso real' : ''}.</div>
+          </div>
         </div>
       )}
 
@@ -3560,8 +3606,27 @@ function SavingsView({ projects, entries, accounts, totalSaved, savedThisMonth, 
   const amountFor = (projectId) => entries.filter(e=>e.projectId===projectId && !e.toAccountId).reduce((a,e)=>a+e.amount,0);
   const sinDestino = entries.filter(e=>!e.projectId && !e.toAccountId).reduce((a,e)=>a+e.amount,0);
   const sortedEntries = [...entries].sort((a,b)=> new Date(b.date) - new Date(a.date));
+
+  // proyectos que están por debajo del mínimo que fijaste para ellos
+  const belowFloorProjects = projects.map(p => {
+    const linkedAccount = (accounts||[]).find(a=>a.id===p.accountId);
+    const saved = linkedAccount ? (linkedAccount.balance||0) : amountFor(p.id);
+    return { project: p, saved, below: p.minFloor!=null && saved < p.minFloor };
+  }).filter(x=>x.below);
+
   return (
     <div className="flex flex-col gap-5">
+      {belowFloorProjects.length>0 && (
+        <div className="flex flex-col gap-2 bg-red-500/10 border border-red-500/30 rounded-2xl p-4 animate-fadein">
+          <div className="flex items-center gap-2 text-sm font-medium text-red-400"><IBell size={16}/> Proyectos por debajo del mínimo que fijaste</div>
+          {belowFloorProjects.map(x => (
+            <div key={x.project.id} className="text-gray-700 dark:text-gray-300 pl-6 text-sm">
+              <span className="font-medium">{x.project.emoji} {x.project.name}</span>: tiene {fmt(x.saved)}, por debajo de tu mínimo de {fmt(x.project.minFloor)}.
+            </div>
+          ))}
+        </div>
+      )}
+
       <KpiCard label="Total ahorrado" value={fmt(totalSaved)} sub={`${entries.length} aporte(s) registrados`} accent="#3DDC97" icon={<IPiggy size={16}/>}/>
       <p className="text-xs text-gray-500 -mt-3 px-1">
         El dinero vive en las cuentas, no en las etiquetas. Un proyecto vinculado a una cuenta muestra el saldo de esa cuenta; si lo desvinculas, el proyecto queda en 0 porque el dinero sigue en la cuenta.
@@ -3620,8 +3685,9 @@ function SavingsView({ projects, entries, accounts, totalSaved, savedThisMonth, 
             // si el proyecto está vinculado a una cuenta, lo ahorrado ES el saldo de esa cuenta
             const saved = linkedAccount ? (linkedAccount.balance||0) : amountFor(p.id);
             const pct = p.targetAmount ? Math.min(100, Math.round((saved/p.targetAmount)*100)) : null;
+            const belowFloor = p.minFloor!=null && saved < p.minFloor;
             return (
-              <div key={p.id} className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft flex flex-col gap-3 animate-fadein">
+              <div key={p.id} className={`bg-white dark:bg-ink-700 border ${belowFloor ? 'border-red-500/50' : 'border-paper-300 dark:border-ink-500/70'} rounded-2xl p-5 shadow-soft flex flex-col gap-3 animate-fadein`}>
                 <div className="flex items-start justify-between">
                   <div className="flex items-center gap-3 min-w-0">
                     <span className="text-2xl shrink-0">{p.emoji}</span>
@@ -3646,6 +3712,13 @@ function SavingsView({ projects, entries, accounts, totalSaved, savedThisMonth, 
                     <div className="text-xs text-gray-500">{pct}% de {fmt(p.targetAmount)}</div>
                   </>
                 ) : <div className="text-xs text-gray-500">Sin meta fija</div>}
+                {p.minFloor!=null && (
+                  belowFloor ? (
+                    <div className="flex items-center gap-1.5 text-red-400 text-xs"><IBell size={12}/> Por debajo del mínimo ({fmt(p.minFloor)})</div>
+                  ) : (
+                    <div className="text-xs text-gray-500">Mínimo fijado: {fmt(p.minFloor)}</div>
+                  )
+                )}
               </div>
             );
           })}
@@ -3964,9 +4037,11 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
     .filter(e => e.fromAccountId===id || e.toAccountId===id)
     .sort((a,b)=> new Date(b.date) - new Date(a.date));
 
-  // pagos que realmente se descontaron de esta cuenta, con su fecha real
+  // pagos que realmente se descontaron de esta cuenta O de sus pockets, con su fecha real —
+  // mandas dinero de aquí a los pockets, así que lo suyo también es, en el fondo, un pago de esta cuenta.
+  const myPocketIds = myPockets.map(p=>p.id);
   const charged = (duePayments||[])
-    .filter(p => p.accountId === id)
+    .filter(p => p.accountId === id || myPocketIds.includes(p.accountId))
     .sort((a,b) => b.date - a.date);
   const typeLabel = { debt:'Deuda', sub:'Suscripción', fixed:'Gasto fijo' };
   // importe que de verdad se movió por cada cargo (puede ser 0 si el corte de "ayer" lo dejó en 0€)
@@ -4161,16 +4236,17 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
           <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-4 shadow-soft flex flex-col divide-paper-300 dark:divide-ink-500/40">
             {expandedSection==='pagos' && charged.map(p => {
               const real = appliedByKey[p.key] || 0;
+              const fromPocket = p.accountId !== id ? nameOf(p.accountId) : null;
               return (
                 <div key={p.key} className="flex items-center gap-3 py-2.5 border-t border-paper-300/60 dark:border-ink-500/40 first:border-t-0">
                   <span className="text-xl shrink-0">{p.emoji}</span>
                   <div className="flex-1 min-w-0">
                     <div className="text-sm text-ink-900 dark:text-gray-100 truncate">{p.name}</div>
-                    <div className="text-xs text-gray-500 truncate">{fmtDate(p.date)} · {typeLabel[p.type]}</div>
+                    <div className="text-xs text-gray-500 truncate">{fmtDate(p.date)} · {typeLabel[p.type]}{fromPocket ? ` · ${fromPocket}` : ''}</div>
                   </div>
                   <span className="font-mono text-sm shrink-0 text-red-400">−{fmt(Math.abs(real))}</span>
                   {real>0 ? (
-                    <button onClick={()=>onCancelCharge({ key:p.key, accountId:id, amount:real, name:`${p.name} · ${fmtDate(p.date)}` })}
+                    <button onClick={()=>onCancelCharge({ key:p.key, accountId:p.accountId, amount:real, name:`${p.name} · ${fmtDate(p.date)}` })}
                       className="text-xs text-gray-500 hover:text-red-400 underline decoration-dotted transition shrink-0">Cancelar</button>
                   ) : <div className="w-[62px] shrink-0"/>}
                 </div>
@@ -4371,12 +4447,14 @@ function AccountsView({ accounts, netWorth, accountsInNet, onAdd, onEdit, onDele
   );
 }
 
-function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, totalCommitted, antThisMonth, antExpenses, onAdd, onEdit, onDelete }) {
+function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, totalCommitted, antThisMonth, antExpenses, simulatedIncome, onSetSimulatedIncome, onAdd, onEdit, onDelete }) {
   const [year, setYear] = useState(new Date().getFullYear());
   const [showLabels, setShowLabels] = useState(true);
   const [compareMode, setCompareMode] = useState(false);
+  const [pctMode, setPctMode] = useState(false);
   const [editingExpected, setEditingExpected] = useState(false);
   const [draft, setDraft] = useState(expected || '');
+  const [simDraft, setSimDraft] = useState('');
   const sorted = [...entries].sort((a,b)=> new Date(b.date) - new Date(a.date));
 
   const years = useMemo(() => {
@@ -4390,12 +4468,25 @@ function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, tot
     const inc = Array(12).fill(0), ant = Array(12).fill(0);
     entries.forEach(e => { const d = new Date(e.date); if (d.getFullYear()===year) inc[d.getMonth()] += e.amount; });
     (antExpenses||[]).forEach(e => { const d = new Date(e.date); if (d.getFullYear()===year) ant[d.getMonth()] += e.amount; });
-    return inc.map((total, i) => ({
-      mes: MESES[i].slice(0,3), mesFull: MESES[i],
-      Entradas: Math.round(total*100)/100,
-      Salidas: Math.round((ant[i] + (total>0 ? totalCommitted : 0))*100)/100,
-    }));
-  }, [entries, antExpenses, year, totalCommitted]);
+    return inc.map((total, i) => {
+      const key = `${year}-${String(i+1).padStart(2,'0')}`;
+      const sim = (simulatedIncome||{})[key] || 0;
+      const isSimulated = total===0 && sim>0;
+      const effectiveIncome = total>0 ? total : sim;
+      // las salidas siempre reflejan lo comprometido de ese mes (deudas+suscripciones+fijos, con tu
+      // compromiso ACTUAL como estimación para meses que no sean el presente) + hormiga — sin
+      // importar si ya se registró el ingreso o no, porque lo comprometido existe igual.
+      const salidasVal = Math.round((ant[i] + totalCommitted)*100)/100;
+      return {
+        mes: MESES[i].slice(0,3), mesFull: MESES[i], key, monthIndex: i,
+        Entradas: Math.round(total*100)/100,
+        Simulado: isSimulated ? Math.round(sim*100)/100 : 0,
+        Salidas: salidasVal,
+        isSimulated,
+        committedPct: effectiveIncome>0 ? Math.round((salidasVal/effectiveIncome)*1000)/10 : null,
+      };
+    });
+  }, [entries, antExpenses, year, totalCommitted, simulatedIncome]);
 
   const monthsWithIncome = byMonth.filter(m=>m.Entradas>0);
   const yearTotal = byMonth.reduce((a,m)=>a+m.Entradas,0);
@@ -4405,9 +4496,28 @@ function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, tot
   // comparación con el mes anterior
   const now = new Date();
   const curM = now.getMonth();
+  const curKey = `${now.getFullYear()}-${String(curM+1).padStart(2,'0')}`;
   const prevTotal = curM > 0 ? byMonth[curM-1].Entradas : 0;
   const delta = thisMonth - prevTotal;
   const deltaPct = prevTotal > 0 ? Math.round((delta/prevTotal)*100) : null;
+
+  // el gráfico solo muestra meses pasados y el actual — nada de meses que todavía no llegan
+  const chartMonths = year === now.getFullYear() ? byMonth.filter(m => m.monthIndex <= curM) : byMonth;
+
+  // meses (del rango mostrado) que todavía no tienen ingreso real — para poder simular cualquiera de ellos
+  const simCandidates = chartMonths.filter(m => m.Entradas===0);
+  const [simMonthKey, setSimMonthKey] = useState('');
+  const activeSimKey = simMonthKey || curKey;
+  const activeSimMonth = chartMonths.find(m=>m.key===activeSimKey) || chartMonths.find(m=>m.key===curKey);
+  const curSimValue = (simulatedIncome||{})[activeSimKey] || 0;
+  // el campo de monto es SOLO local (simDraft) — únicamente lo "sembramos" con el valor guardado
+  // cuando cambias de mes a simular, nunca mientras escribes, para que nada externo te lo borre a medio escribir.
+  useEffect(() => { setSimDraft(curSimValue ? String(curSimValue) : ''); }, [activeSimKey]);
+
+  // % comprometido de este mes (real si hay, si no con el simulado) — para la alerta del 45%
+  const effectiveIncomeThisMonth = thisMonth>0 ? thisMonth : ((simulatedIncome||{})[curKey] || 0);
+  const committedPctThisMonth = effectiveIncomeThisMonth>0 ? Math.round(((totalCommitted+antThisMonth)/effectiveIncomeThisMonth)*1000)/10 : null;
+  const overLimit = committedPctThisMonth!==null && committedPctThisMonth>45;
 
   // tasa de ahorro de este mes
   const spentThisMonth = totalCommitted + antThisMonth;
@@ -4418,6 +4528,7 @@ function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, tot
   // ingreso esperado vs. real
   const expectedDelta = expected > 0 ? thisMonth - expected : null;
   const saveExpected = () => { onSetExpected(Number(draft) || 0); setEditingExpected(false); };
+  const saveSimulated = () => { onSetSimulatedIncome(activeSimKey, Number(simDraft) || 0); setSimDraft(''); };
 
   // desglose por fuente (año seleccionado)
   const bySource = useMemo(() => {
@@ -4448,6 +4559,17 @@ function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, tot
           <span>
             Este mes llevas {fmt(Math.abs(delta))} {delta>=0 ? 'más' : 'menos'} que en {MESES[curM-1].toLowerCase()}
             {deltaPct!==null && ` (${delta>=0?'+':''}${deltaPct}%)`}.
+          </span>
+        </div>
+      )}
+
+      {committedPctThisMonth!==null && (
+        <div className={`flex items-center gap-2 text-sm rounded-2xl px-4 py-3 border ${overLimit ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'}`}>
+          {overLimit ? '⚠️' : '✓'}
+          <span>
+            Lo comprometido (deudas + suscripciones + fijos + hormiga) es el <b>{committedPctThisMonth}%</b> de tu ingreso {thisMonth===0 ? 'simulado' : ''} este mes
+            {overLimit ? ' — por encima del 45% recomendado.' : ', dentro del 45% recomendado.'}
+            {thisMonth===0 && ' (esto es una simulación — cuando pongas el ingreso real, el porcentaje se recalcula solo)'}
           </span>
         </div>
       )}
@@ -4494,13 +4616,19 @@ function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, tot
       <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft">
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <span className="uppercase tracking-wider text-gray-500 dark:text-gray-400 font-medium">
-            {compareMode ? 'Entradas vs. salidas' : 'Ingresos mensuales'}
+            {pctMode ? '% comprometido de tus ingresos' : compareMode ? 'Entradas vs. salidas' : 'Ingresos mensuales'}
           </span>
           <div className="flex flex-wrap items-center gap-2">
             <button onClick={()=>setCompareMode(m=>!m)}
               className={`px-2.5 py-1 rounded-full text-xs transition border ${compareMode ? 'bg-gold-500 text-ink-900 font-medium border-transparent' : 'text-gray-500 border-paper-300 dark:border-ink-500 hover:text-ink-900 dark:hover:text-gray-200'}`}>
               Comparar con gastos
             </button>
+            {compareMode && (
+              <button onClick={()=>setPctMode(m=>!m)}
+                className={`px-2.5 py-1 rounded-full text-xs transition border ${pctMode ? 'bg-gold-500 text-ink-900 font-medium border-transparent' : 'text-gray-500 border-paper-300 dark:border-ink-500 hover:text-ink-900 dark:hover:text-gray-200'}`}>
+                Ver en %
+              </button>
+            )}
             <button onClick={()=>setShowLabels(v=>!v)}
               className={`px-2.5 py-1 rounded-full text-xs transition border ${showLabels ? 'bg-gold-500 text-ink-900 font-medium border-transparent' : 'text-gray-500 border-paper-300 dark:border-ink-500 hover:text-ink-900 dark:hover:text-gray-200'}`}>
               {showLabels ? 'Ocultar números' : 'Mostrar números'}
@@ -4517,10 +4645,27 @@ function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, tot
         </div>
         {yearTotal === 0 ? (
           <p className="text-sm text-gray-500">Sin ingresos registrados en {year}.</p>
+        ) : pctMode ? (
+          <div className="h-72">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={chartMonths} margin={{top:22, right:8, left:0, bottom:0}}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#8A8F9822" vertical={false}/>
+                <XAxis dataKey="mes" tick={{fontSize:11, fill:'#8A8F98'}} axisLine={false} tickLine={false}/>
+                <YAxis tick={{fontSize:11, fill:'#8A8F98'}} axisLine={false} tickLine={false} tickFormatter={(v)=>`${v}%`}/>
+                <Tooltip formatter={(v)=> v==null ? 'Sin ingreso' : `${v}%`} cursor={{fill:'#8A8F9811'}}
+                  contentStyle={{background:'#1A1D23', border:'1px solid #2A2E37', borderRadius:12, fontSize:12, color:'#E6E8EB'}}/>
+                <ReferenceLine y={45} stroke="#EF4444" strokeDasharray="5 4" label={{value:'45%', position:'right', fontSize:11, fill:'#EF4444'}}/>
+                <Bar dataKey="committedPct" radius={[6,6,0,0]} maxBarSize={30}
+                  label={showLabels ? {position:'top', fontSize:10, fill:'#8A8F98', formatter:(v)=> v!=null ? `${v}%` : ''} : false}>
+                  {byMonth.map((m,i)=><Cell key={i} fill={m.committedPct==null ? '#8A8F9855' : m.committedPct>45 ? COLORS.debt : '#3DDC97'}/>)}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
         ) : (
           <div className="h-72">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={byMonth} margin={{top:22, right:8, left:0, bottom:0}}>
+              <BarChart data={chartMonths} margin={{top:22, right:8, left:0, bottom:0}}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#8A8F9822" vertical={false}/>
                 <XAxis dataKey="mes" tick={{fontSize:11, fill:'#8A8F98'}} axisLine={false} tickLine={false}/>
                 <YAxis tick={{fontSize:11, fill:'#8A8F98'}} axisLine={false} tickLine={false} tickFormatter={(v)=>`${v}€`}/>
@@ -4530,6 +4675,10 @@ function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, tot
                 <Bar dataKey="Entradas" fill="#3DDC97" radius={[6,6,0,0]} maxBarSize={compareMode?22:44}
                   label={showLabels ? {position:'top', fontSize:10, fill:'#8A8F98', formatter:(v)=> v>0 ? `${Math.round(v)}€` : ''} : false}/>
                 {compareMode && (
+                  <Bar dataKey="Simulado" fill="#111318" radius={[6,6,0,0]} maxBarSize={22} name="Simulado"
+                    label={showLabels ? {position:'top', fontSize:10, fill:'#8A8F98', formatter:(v)=> v>0 ? `${Math.round(v)}€` : ''} : false}/>
+                )}
+                {compareMode && (
                   <Bar dataKey="Salidas" fill={COLORS.debt} radius={[6,6,0,0]} maxBarSize={22}
                     label={showLabels ? {position:'top', fontSize:10, fill:'#8A8F98', formatter:(v)=> v>0 ? `${Math.round(v)}€` : ''} : false}/>
                 )}
@@ -4537,12 +4686,41 @@ function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, tot
             </ResponsiveContainer>
           </div>
         )}
-        {compareMode && (
+        {compareMode && !pctMode && (
           <p className="text-xs text-gray-500 mt-3">
-            Las salidas usan tu compromiso mensual actual ({fmt(totalCommitted)}) más los gastos hormiga de cada mes, así que son una estimación.
+            Las salidas usan tu compromiso mensual actual ({fmt(totalCommitted)}) más los gastos hormiga de cada mes, así que son una estimación. La barra negra es un ingreso simulado (aún no cobrado).
+          </p>
+        )}
+        {pctMode && (
+          <p className="text-xs text-gray-500 mt-3">
+            Verde: comprometido dentro del 45% de tu ingreso ese mes. Rojo: por encima. Gris: sin ingreso (real ni simulado) para calcular el %.
           </p>
         )}
       </div>
+
+      {year===now.getFullYear() && simCandidates.length>0 && (
+        <div className="bg-white dark:bg-ink-700 border-2 border-ink-900 dark:border-gray-200 rounded-2xl p-5 shadow-soft flex flex-col gap-3">
+          <div className="flex items-center justify-between">
+            <span className="uppercase tracking-wider text-gray-500 dark:text-gray-400 font-medium">🖤 Simular un ingreso</span>
+            <span className="text-[10px] uppercase text-gray-500 border border-paper-300 dark:border-ink-500 rounded-full px-1.5 py-0.5">No mueve nada real</span>
+          </div>
+          <p className="text-sm text-gray-500">Para un mes sin ingreso real todavía (ej. el sueldo que aún no te pagan). Se dibuja como barra negra en el gráfico y calcula el % comprometido de ese mes — no toca tus entradas reales, tu saldo ni ninguna otra cuenta.</p>
+          <div className="flex items-center gap-2 flex-wrap">
+            {simCandidates.length>1 ? (
+              <select className={inputCls+" max-w-[160px]"} value={activeSimKey} onChange={e=>setSimMonthKey(e.target.value)}>
+                {simCandidates.map(m => <option key={m.key} value={m.key}>{m.mesFull}</option>)}
+              </select>
+            ) : (
+              <span className="text-sm text-ink-900 dark:text-gray-100 font-medium min-w-[80px]">{activeSimMonth ? activeSimMonth.mesFull : ''}</span>
+            )}
+            <input type="number" step="0.01" className={inputCls+" max-w-[160px]"} placeholder="Ej. 1533"
+              value={simDraft} onChange={e=>setSimDraft(e.target.value)} onKeyDown={e=>e.key==='Enter' && saveSimulated()}/>
+            <button onClick={saveSimulated} className="px-3 py-2 rounded-lg bg-ink-900 hover:bg-ink-700 text-white dark:bg-gray-200 dark:hover:bg-white dark:text-ink-900 text-sm font-medium transition">Simular</button>
+            {curSimValue>0 && <button onClick={()=>{onSetSimulatedIncome(activeSimKey, 0); setSimDraft('');}} className="px-3 py-2 rounded-lg text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600 text-sm transition">Quitar</button>}
+          </div>
+          {!compareMode && <p className="text-xs text-gold-500">Activa "Comparar con gastos" arriba en el gráfico para ver la barra negra.</p>}
+        </div>
+      )}
 
       {/* Desglose por fuente */}
       {bySource.length > 0 && (
