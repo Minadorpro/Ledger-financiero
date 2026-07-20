@@ -2631,7 +2631,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         const firstIdx = first.getFullYear()*12 + first.getMonth();
         return acc + ((curIdx + i) >= firstIdx ? d.monthlyPayment : 0);
       }, 0);
-      months.push({ mes: MESES[monthDate.getMonth()].slice(0,3), total: Math.round((installmentSum+revolvingSum+subsMonthlyReal+totalFixedMonthly)*100)/100 });
+      months.push({ mes: MESES[monthDate.getMonth()].slice(0,3), key: `${monthDate.getFullYear()}-${String(monthDate.getMonth()+1).padStart(2,'0')}`, total: Math.round((installmentSum+revolvingSum+subsMonthlyReal+totalFixedMonthly)*100)/100 });
     }
     return months;
   }, [installmentDebts, revolvingDebts, subsMonthlyReal, totalFixedMonthly]);
@@ -2876,6 +2876,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                   expected={expectedIncome} onSetExpected={setExpectedIncome}
                   totalCommitted={totalCommitted} antThisMonth={antThisMonth} antExpenses={antExpenses}
                   simulatedIncome={simulatedIncome} onSetSimulatedIncome={(key,v)=>setSimulatedIncome(s=>({...s,[key]:v}))}
+                  projection={projection}
                   onAdd={()=>setModal({type:'income'})} onEdit={(e)=>setModal({type:'income', item:e})}
                   onDelete={(e)=>setConfirmDel({type:'income', id:e.id, name:fmt(e.amount)})}/>
               )}
@@ -4447,7 +4448,7 @@ function AccountsView({ accounts, netWorth, accountsInNet, onAdd, onEdit, onDele
   );
 }
 
-function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, totalCommitted, antThisMonth, antExpenses, simulatedIncome, onSetSimulatedIncome, onAdd, onEdit, onDelete }) {
+function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, totalCommitted, antThisMonth, antExpenses, simulatedIncome, onSetSimulatedIncome, projection, onAdd, onEdit, onDelete }) {
   const [year, setYear] = useState(new Date().getFullYear());
   const [showLabels, setShowLabels] = useState(true);
   const [compareMode, setCompareMode] = useState(false);
@@ -4463,30 +4464,47 @@ function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, tot
     return [...set].sort((a,b)=>b-a);
   }, [entries]);
 
+  // proyección real mes a mes (deudas que terminan/empiezan, no un número plano) — la usamos para
+  // que las salidas de meses futuros sean exactas en vez de repetir siempre el compromiso actual.
+  const projectionByKey = useMemo(() => {
+    const map = {};
+    (projection||[]).forEach(p => { map[p.key] = p.total; });
+    return map;
+  }, [projection]);
+  const salidasForKey = (key, antsForMonth) => {
+    const projected = projectionByKey[key];
+    return Math.round(((projected!=null ? projected : totalCommitted) + (antsForMonth||0)) * 100) / 100;
+  };
+
   // totales por mes del año seleccionado (ingresos y gastos hormiga)
   const byMonth = useMemo(() => {
     const inc = Array(12).fill(0), ant = Array(12).fill(0);
     entries.forEach(e => { const d = new Date(e.date); if (d.getFullYear()===year) inc[d.getMonth()] += e.amount; });
     (antExpenses||[]).forEach(e => { const d = new Date(e.date); if (d.getFullYear()===year) ant[d.getMonth()] += e.amount; });
+    const nowLocal = new Date();
+    const curMLocal = nowLocal.getMonth();
     return inc.map((total, i) => {
       const key = `${year}-${String(i+1).padStart(2,'0')}`;
       const sim = (simulatedIncome||{})[key] || 0;
+      const isFuture = year===nowLocal.getFullYear() && i > curMLocal;
       const isSimulated = total===0 && sim>0;
       const effectiveIncome = total>0 ? total : sim;
-      // las salidas siempre reflejan lo comprometido de ese mes (deudas+suscripciones+fijos, con tu
-      // compromiso ACTUAL como estimación para meses que no sean el presente) + hormiga — sin
-      // importar si ya se registró el ingreso o no, porque lo comprometido existe igual.
-      const salidasVal = Math.round((ant[i] + totalCommitted)*100)/100;
+      // las salidas usan la proyección real de ESE mes (si cae dentro de los próximos 12) + hormiga.
+      // Un mes futuro que todavía no llega se queda VACÍO del todo (ni entrada ni salida) hasta que
+      // simules un ingreso para él o llegue el real — para no mostrar gastos de meses que ni siquiera
+      // han empezado.
+      const showSalidas = !isFuture || isSimulated;
+      const salidasVal = showSalidas ? salidasForKey(key, ant[i]) : 0;
       return {
         mes: MESES[i].slice(0,3), mesFull: MESES[i], key, monthIndex: i,
         Entradas: Math.round(total*100)/100,
         Simulado: isSimulated ? Math.round(sim*100)/100 : 0,
         Salidas: salidasVal,
-        isSimulated,
-        committedPct: effectiveIncome>0 ? Math.round((salidasVal/effectiveIncome)*1000)/10 : null,
+        isSimulated, isFuture,
+        committedPct: (showSalidas && effectiveIncome>0) ? Math.round((salidasVal/effectiveIncome)*1000)/10 : null,
       };
     });
-  }, [entries, antExpenses, year, totalCommitted, simulatedIncome]);
+  }, [entries, antExpenses, year, totalCommitted, simulatedIncome, projectionByKey]);
 
   const monthsWithIncome = byMonth.filter(m=>m.Entradas>0);
   const yearTotal = byMonth.reduce((a,m)=>a+m.Entradas,0);
@@ -4501,18 +4519,23 @@ function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, tot
   const delta = thisMonth - prevTotal;
   const deltaPct = prevTotal > 0 ? Math.round((delta/prevTotal)*100) : null;
 
-  // el gráfico solo muestra meses pasados y el actual — nada de meses que todavía no llegan
-  const chartMonths = year === now.getFullYear() ? byMonth.filter(m => m.monthIndex <= curM) : byMonth;
+  // el gráfico muestra los 12 meses del año elegido — los que aún no llegan quedan vacíos (ver arriba)
+  const chartMonths = byMonth;
 
-  // meses (del rango mostrado) que todavía no tienen ingreso real — para poder simular cualquiera de ellos
-  const simCandidates = chartMonths.filter(m => m.Entradas===0);
-  const [simMonthKey, setSimMonthKey] = useState('');
-  const activeSimKey = simMonthKey || curKey;
-  const activeSimMonth = chartMonths.find(m=>m.key===activeSimKey) || chartMonths.find(m=>m.key===curKey);
+  // simulador: mes elegido a mano (mes + año), cualquiera — no solo los que faltan por cobrar
+  const [simKeyInput, setSimKeyInput] = useState('');
+  const activeSimKey = simKeyInput || curKey;
+  const [simY, simMIdx] = activeSimKey.split('-').map(Number);
+  const activeSimLabel = `${MESES[simMIdx-1]} ${simY}`;
+  const inChartRange = simY === year;
   const curSimValue = (simulatedIncome||{})[activeSimKey] || 0;
   // el campo de monto es SOLO local (simDraft) — únicamente lo "sembramos" con el valor guardado
   // cuando cambias de mes a simular, nunca mientras escribes, para que nada externo te lo borre a medio escribir.
   useEffect(() => { setSimDraft(curSimValue ? String(curSimValue) : ''); }, [activeSimKey]);
+  // vista previa del mes simulado cuando cae FUERA del gráfico (futuro, u otro año) — usa la
+  // proyección real de ese mes, no el estimado plano.
+  const simPreviewSalidas = salidasForKey(activeSimKey, activeSimKey===curKey ? antThisMonth : 0);
+  const simPreviewPct = curSimValue>0 ? Math.round((simPreviewSalidas/curSimValue)*1000)/10 : null;
 
   // % comprometido de este mes (real si hay, si no con el simulado) — para la alerta del 45%
   const effectiveIncomeThisMonth = thisMonth>0 ? thisMonth : ((simulatedIncome||{})[curKey] || 0);
@@ -4688,7 +4711,7 @@ function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, tot
         )}
         {compareMode && !pctMode && (
           <p className="text-xs text-gray-500 mt-3">
-            Las salidas usan tu compromiso mensual actual ({fmt(totalCommitted)}) más los gastos hormiga de cada mes, así que son una estimación. La barra negra es un ingreso simulado (aún no cobrado).
+            Las salidas de meses ya pasados o en curso usan tu proyección real (deudas que terminan o empiezan) más los gastos hormiga. Los meses futuros se quedan vacíos hasta que simules un ingreso para ellos — ahí aparecen con su entrada simulada (barra negra) y su salida proyectada.
           </p>
         )}
         {pctMode && (
@@ -4698,29 +4721,42 @@ function IncomeView({ entries, thisMonth, thisYear, expected, onSetExpected, tot
         )}
       </div>
 
-      {year===now.getFullYear() && simCandidates.length>0 && (
-        <div className="bg-white dark:bg-ink-700 border-2 border-ink-900 dark:border-gray-200 rounded-2xl p-5 shadow-soft flex flex-col gap-3">
-          <div className="flex items-center justify-between">
-            <span className="uppercase tracking-wider text-gray-500 dark:text-gray-400 font-medium">🖤 Simular un ingreso</span>
-            <span className="text-[10px] uppercase text-gray-500 border border-paper-300 dark:border-ink-500 rounded-full px-1.5 py-0.5">No mueve nada real</span>
-          </div>
-          <p className="text-sm text-gray-500">Para un mes sin ingreso real todavía (ej. el sueldo que aún no te pagan). Se dibuja como barra negra en el gráfico y calcula el % comprometido de ese mes — no toca tus entradas reales, tu saldo ni ninguna otra cuenta.</p>
-          <div className="flex items-center gap-2 flex-wrap">
-            {simCandidates.length>1 ? (
-              <select className={inputCls+" max-w-[160px]"} value={activeSimKey} onChange={e=>setSimMonthKey(e.target.value)}>
-                {simCandidates.map(m => <option key={m.key} value={m.key}>{m.mesFull}</option>)}
-              </select>
-            ) : (
-              <span className="text-sm text-ink-900 dark:text-gray-100 font-medium min-w-[80px]">{activeSimMonth ? activeSimMonth.mesFull : ''}</span>
-            )}
-            <input type="number" step="0.01" className={inputCls+" max-w-[160px]"} placeholder="Ej. 1533"
-              value={simDraft} onChange={e=>setSimDraft(e.target.value)} onKeyDown={e=>e.key==='Enter' && saveSimulated()}/>
-            <button onClick={saveSimulated} className="px-3 py-2 rounded-lg bg-ink-900 hover:bg-ink-700 text-white dark:bg-gray-200 dark:hover:bg-white dark:text-ink-900 text-sm font-medium transition">Simular</button>
-            {curSimValue>0 && <button onClick={()=>{onSetSimulatedIncome(activeSimKey, 0); setSimDraft('');}} className="px-3 py-2 rounded-lg text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600 text-sm transition">Quitar</button>}
-          </div>
-          {!compareMode && <p className="text-xs text-gold-500">Activa "Comparar con gastos" arriba en el gráfico para ver la barra negra.</p>}
+      <div className="bg-white dark:bg-ink-700 border-2 border-ink-900 dark:border-gray-200 rounded-2xl p-5 shadow-soft flex flex-col gap-3">
+        <div className="flex items-center justify-between">
+          <span className="uppercase tracking-wider text-gray-500 dark:text-gray-400 font-medium">🖤 Simular un ingreso</span>
+          <span className="text-[10px] uppercase text-gray-500 border border-paper-300 dark:border-ink-500 rounded-full px-1.5 py-0.5">No mueve nada real</span>
         </div>
-      )}
+        <p className="text-sm text-gray-500">Para un mes sin ingreso real todavía (ej. el sueldo que aún no te pagan). Elige el mes a mano — si cae dentro del gráfico se dibuja como barra negra ahí; si es un mes futuro, te muestro la vista previa con la proyección real de ese mes (deudas que terminan o empiezan, no un número plano). No toca tus entradas reales, tu saldo ni ninguna otra cuenta.</p>
+        <div className="flex items-center gap-2 flex-wrap">
+          <input type="month" className={inputCls+" max-w-[160px]"} value={activeSimKey} onChange={e=>{ setSimKeyInput(e.target.value); const y=Number(e.target.value.split('-')[0]); if (y) setYear(y); }}/>
+          <input type="number" step="0.01" className={inputCls+" max-w-[160px]"} placeholder="Ej. 1533"
+            value={simDraft} onChange={e=>setSimDraft(e.target.value)} onKeyDown={e=>e.key==='Enter' && saveSimulated()}/>
+          <button onClick={saveSimulated} className="px-3 py-2 rounded-lg bg-ink-900 hover:bg-ink-700 text-white dark:bg-gray-200 dark:hover:bg-white dark:text-ink-900 text-sm font-medium transition">Simular</button>
+          {curSimValue>0 && <button onClick={()=>{onSetSimulatedIncome(activeSimKey, 0); setSimDraft('');}} className="px-3 py-2 rounded-lg text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600 text-sm transition">Quitar</button>}
+        </div>
+        {inChartRange ? (
+          !compareMode && <p className="text-xs text-gold-500">Activa "Comparar con gastos" arriba en el gráfico para ver la barra negra de {activeSimLabel}.</p>
+        ) : curSimValue>0 ? (
+          <div className="bg-paper-200/60 dark:bg-ink-600/40 rounded-xl p-3 flex flex-col gap-1">
+            <div className="text-sm font-medium text-ink-900 dark:text-gray-100">Vista previa — {activeSimLabel}</div>
+            <div className="flex justify-between text-sm">
+              <span className="text-gray-500">Ingreso simulado</span>
+              <span className="font-mono text-emerald-400">{fmt(curSimValue)}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-gray-500">Comprometido (proyección real de ese mes)</span>
+              <span className="font-mono text-red-400">{fmt(simPreviewSalidas)}</span>
+            </div>
+            {simPreviewPct!==null && (
+              <div className="flex justify-between text-sm">
+                <span className="text-gray-500">% comprometido</span>
+                <span className={`font-mono font-medium ${simPreviewPct>45 ? 'text-red-400' : 'text-emerald-400'}`}>{simPreviewPct}%{simPreviewPct>45 ? ' — por encima del 45%' : ''}</span>
+              </div>
+            )}
+            <p className="text-[11px] text-gray-500 mt-1">Este mes está fuera del año/rango que se ve en el gráfico de arriba, así que se muestra aquí como vista previa en vez de como barra.</p>
+          </div>
+        ) : null}
+      </div>
 
       {/* Desglose por fuente */}
       {bySource.length > 0 && (
