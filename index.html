@@ -213,25 +213,31 @@ function makeDataStore(uid) {
       return snap.exists ? snap.data() : null;
     },
     async save(data) {
-      // CANDADO DE SEGURIDAD: antes de guardar, miramos qué hay AHORA MISMO en el servidor
-      // (no lo que tenemos en memoria, que podría estar desactualizado). Si el servidor tiene
-      // bastante contenido y lo que estamos a punto de guardar lo dejaría prácticamente vacío,
-      // cancelamos el guardado en vez de arriesgarnos a borrar algo real por accidente (ej. una
-      // pestaña vieja que nunca se recargó reafirmando datos viejos encima de los nuevos).
+      // CANDADO DE SEGURIDAD: si lo que estamos a punto de guardar parece vacío, antes de guardar
+      // miramos qué hay AHORA MISMO en el servidor (no lo que tenemos en memoria, que podría estar
+      // desactualizado). Si el servidor tiene bastante contenido y esto lo dejaría prácticamente
+      // vacío, cancelamos el guardado en vez de arriesgarnos a borrar algo real por accidente.
+      //
+      // Solo hacemos esta lectura extra cuando newCount===0 — el único caso donde de verdad hace
+      // falta comprobar. Antes se hacía SIEMPRE, en cada guardado, duplicando el viaje de red de
+      // TODOS los guardados normales (que son la inmensa mayoría) — eso sumaba latencia real y
+      // podía sentirse como que hacía falta reintentar varias veces para que algo se guardara.
       const countOf = (d) => (!d ? 0 :
         (d.debts||[]).length + (d.subscriptions||[]).length + (d.fixedExpenses||[]).length +
         (d.savingsProjects||[]).length + (d.incomeSplitRules||[]).length + (d.financialGoals||[]).length);
-      try {
-        const current = await ref.get();
-        const serverCount = current.exists ? countOf(current.data()) : 0;
-        const newCount = countOf(data);
-        if (serverCount >= 3 && newCount === 0) {
-          throw new Error(`Guardado bloqueado por seguridad: el servidor tiene ${serverCount} elemento(s) (deudas/suscripciones/gastos/etc.) y este dispositivo estaba a punto de guardar 0. Recarga la página para traer los datos reales antes de seguir.`);
+      const newCount = countOf(data);
+      if (newCount === 0) {
+        try {
+          const current = await ref.get();
+          const serverCount = current.exists ? countOf(current.data()) : 0;
+          if (serverCount >= 3) {
+            throw new Error(`Guardado bloqueado por seguridad: el servidor tiene ${serverCount} elemento(s) (deudas/suscripciones/gastos/etc.) y este dispositivo estaba a punto de guardar 0. Recarga la página para traer los datos reales antes de seguir.`);
+          }
+        } catch (e) {
+          if (String(e.message).startsWith('Guardado bloqueado')) throw e;
+          // si falla la lectura de comprobación (ej. sin internet un instante), dejamos pasar el
+          // guardado normal — es mejor eso que bloquear la app entera por una falla de red puntual.
         }
-      } catch (e) {
-        if (String(e.message).startsWith('Guardado bloqueado')) throw e;
-        // si falla la lectura de comprobación (ej. sin internet un instante), dejamos pasar el
-        // guardado normal — es mejor eso que bloquear la app entera por una falla de red puntual.
       }
       await ref.set(data);
     },
@@ -355,6 +361,23 @@ function fmt(n) {
 function fmtNum(n) { return (Number(n)||0).toLocaleString('es-ES', {maximumFractionDigits:2}); }
 
 function todayISO() { return new Date().toISOString().slice(0,10); }
+function currentMonthKey() { const n = new Date(); return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,'0')}`; }
+// a qué ciclo (mes) pertenece el PRÓXIMO día de interés, contando desde hoy — si el día de interés
+// de este mes ya pasó, es el del mes siguiente. Así, pagues en manual el día que sea, el interés
+// siempre queda agendado para la fecha real que le toque, no para "este mes" a ciegas.
+function nextInterestCycleKey(interestDay) {
+  const now = new Date();
+  let y = now.getFullYear(), m = now.getMonth();
+  if (now.getDate() > (interestDay||15)) { m++; if (m>11) { m=0; y++; } }
+  return `${y}-${String(m+1).padStart(2,'0')}`;
+}
+// busca el ciclo con interés pendiente de una tarjeta — puede no ser "este mes" (si pagaste ahora
+// pero el día de interés cae el mes que viene, el pendiente vive ahí, no en el mes actual)
+function findPendingInterestCycle(debt) {
+  const entries = Object.entries(debt.ccCycles || {});
+  const found = entries.find(([k, c]) => c.pending && !c.interestDone);
+  return found ? { key: found[0], cyc: found[1] } : null;
+}
 // medianoche de AYER — corte usado por el motor de saldos: nada anterior a esto mueve el saldo de una cuenta
 function yesterdayStart() {
   const d = new Date(); d.setHours(0,0,0,0); d.setDate(d.getDate()-1);
@@ -474,6 +497,35 @@ function elapsedInstallments(debt) {
 function effectivePaid(debt) {
   if (debt.noEndDate) return debt.paidInstallments || 0;
   return debt.mode === 'auto' ? elapsedInstallments(debt) : debt.paidInstallments;
+}
+
+// el saldo REAL de una tarjeta de crédito: si está unida a una cuenta, es el de esa cuenta ahora
+// mismo (en vivo, nunca un número guardado que se pueda desactualizar); si no, el de la deuda misma.
+function creditCardBalance(debt, accounts) {
+  if (debt.linkedBalanceAccountId) {
+    const acc = (accounts||[]).find(a=>a.id===debt.linkedBalanceAccountId);
+    if (acc) return Math.max(0, Math.round(-(acc.balance||0)*100)/100);
+  }
+  return debt.totalValue || 0;
+}
+
+// pago mínimo de una tarjeta de crédito: % del importe total debido, con un piso en €
+function creditCardMinPayment(debt) {
+  const pct = (debt.minPaymentPercent || 3) / 100;
+  const floor = debt.minPaymentFloor || 30;
+  const calculated = (debt.totalValue || 0) * pct;
+  return Math.min(debt.totalValue || 0, Math.max(calculated, floor));
+}
+
+// simula qué pasa con el saldo de una tarjeta si pagas "amount": si cubre el total, sin intereses;
+// si no, el interés de este ciclo se suma a lo que queda debiendo, para el próximo ciclo.
+function simulateCreditCardPayment(debt, amount) {
+  const paid = Math.max(0, Math.min(amount, debt.totalValue || 0));
+  const remaining = Math.round(((debt.totalValue || 0) - paid) * 100) / 100;
+  const isFullPayment = remaining <= 0.01;
+  const interest = isFullPayment ? 0 : Math.round(remaining * ((debt.interestRate || 0) / 100) * 100) / 100;
+  const newBalance = isFullPayment ? 0 : Math.round((remaining + interest) * 100) / 100;
+  return { paid, remaining, interest, newBalance, isFullPayment };
 }
 
 // ¿ya empezó esta deuda a día de hoy? (el mes de la primera cuota ya llegó o pasó)
@@ -1044,18 +1096,39 @@ function DebtForm({ initial, accounts, onSave, onClose }) {
   const [f, setF] = useState(initial || {
     name:'', emoji:'💳', totalValue:'', monthlyPayment:'', totalInstallments:'', paidInstallments:0,
     firstPaymentDate: todayISO(), paymentDay: 1, mode:'manual', noEndDate:false,
+    isCreditCard:false, interestRate:'', minPaymentPercent:3, minPaymentFloor:30,
+    interestDay:15, autoPaymentMode:'minimum', autoCustomAmount:'', linkedBalanceAccountId:'',
   });
   const set = (k,v) => setF(s=>({...s,[k]:v}));
+  const isCC = f.noEndDate && !!f.isCreditCard;
+  const linkedAcc = f.linkedBalanceAccountId ? accounts.find(a=>a.id===f.linkedBalanceAccountId) : null;
   const submit = (e) => {
     e.preventDefault();
-    if (!f.name || !f.monthlyPayment || (!f.noEndDate && !f.totalInstallments)) return;
+    if (!f.name || (!isCC && !f.monthlyPayment) || (!f.noEndDate && !f.totalInstallments)) return;
+    // si la tarjeta está unida a una cuenta, el saldo real SIEMPRE es el de esa cuenta (en positivo,
+    // ya que la cuenta lo lleva en negativo) — no lo que se haya escrito a mano en "Saldo actual".
+    const totalValueNum = (isCC && linkedAcc) ? Math.max(0, -(linkedAcc.balance||0))
+      : Number(f.totalValue) || (f.noEndDate ? 0 : Number(f.monthlyPayment)*Number(f.totalInstallments));
+    const minPaymentPercentNum = Number(f.minPaymentPercent) || 3;
+    const minPaymentFloorNum = Number(f.minPaymentFloor) || 30;
     onSave({
       ...f,
-      totalValue: Number(f.totalValue) || (f.noEndDate ? 0 : Number(f.monthlyPayment)*Number(f.totalInstallments)),
-      monthlyPayment: Number(f.monthlyPayment),
+      totalValue: totalValueNum,
+      linkedBalanceAccountId: isCC ? (f.linkedBalanceAccountId || null) : null,
+      // para tarjetas de crédito, el "pago mínimo mensual" no se pone a mano — es siempre el 3%
+      // (o el % que pongas) del saldo actual, con tu piso en €. Se recalcula solo cada vez que el
+      // saldo cambie (al pagar), así que aquí solo lo calculamos para el momento de guardar.
+      monthlyPayment: isCC ? Math.round(creditCardMinPayment({ totalValue: totalValueNum, minPaymentPercent: minPaymentPercentNum, minPaymentFloor: minPaymentFloorNum })*100)/100 : Number(f.monthlyPayment),
       totalInstallments: f.noEndDate ? 0 : Number(f.totalInstallments),
       paidInstallments: f.noEndDate ? 0 : Math.min(Number(f.paidInstallments)||0, Number(f.totalInstallments)),
       paymentDay: Number(f.paymentDay),
+      isCreditCard: isCC,
+      interestRate: Number(f.interestRate) || 0,
+      minPaymentPercent: minPaymentPercentNum,
+      minPaymentFloor: minPaymentFloorNum,
+      interestDay: Number(f.interestDay) || 15,
+      autoPaymentMode: f.autoPaymentMode || 'minimum',
+      autoCustomAmount: Number(f.autoCustomAmount) || 0,
     });
   };
   return (
@@ -1074,14 +1147,61 @@ function DebtForm({ initial, accounts, onSave, onClose }) {
         Sin fecha límite <span className="text-gray-500 text-xs">(tarjeta de crédito — sin número fijo de cuotas)</span>
       </label>
 
-      <div className="grid grid-cols-2 gap-4">
-        <Field label={f.noEndDate ? "Saldo actual (€)" : "Valor total (€)"}>
-          <input type="number" step="0.01" className={inputCls} value={f.totalValue} onChange={e=>set('totalValue', e.target.value)} placeholder={f.noEndDate ? "Ej. 350" : "Opcional"}/>
+      {f.noEndDate && (
+        <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 bg-paper-200 dark:bg-ink-600 rounded-lg px-3 py-2.5">
+          <input type="checkbox" checked={!!f.isCreditCard} onChange={e=>set('isCreditCard', e.target.checked)} className="accent-gold-500 w-4 h-4"/>
+          Es una tarjeta de crédito <span className="text-gray-500 text-xs">(cobra intereses si no pagas el importe total)</span>
+        </label>
+      )}
+
+      {isCC && (
+        <Field label="Unir a una cuenta (opcional)">
+          <select className={inputCls} value={f.linkedBalanceAccountId||''} onChange={e=>set('linkedBalanceAccountId', e.target.value)}>
+            <option value="">No — llevar el saldo aparte, solo en esta deuda</option>
+            {orderedAccountsForSelect(accounts).map(a => <option key={a.id} value={a.id}>{a.parentAccountId ? '↳ ' : ''}{a.emoji} {a.name}</option>)}
+          </select>
+          <p className="text-xs text-gray-500 mt-1.5">
+            {linkedAcc
+              ? `Unida a ${linkedAcc.emoji} ${linkedAcc.name}: el saldo real de esa cuenta (${fmt(linkedAcc.balance||0)}) ES el saldo de esta tarjeta — no hay dos números que sincronizar a mano, igual que un proyecto de ahorro unido a una cuenta.`
+              : 'Si tu tarjeta ya es una cuenta en negativo (ej. "YOU"), únela aquí para que ambas sean el mismo número, en vez de llevar dos saldos por separado.'}
+          </p>
         </Field>
-        <Field label={f.noEndDate ? "Pago mínimo mensual (€)" : "Cuota mensual (€)"}>
-          <input type="number" step="0.01" className={inputCls} value={f.monthlyPayment} onChange={e=>set('monthlyPayment', e.target.value)} required/>
+      )}
+
+      {isCC ? (
+        <Field label="Saldo actual (€)">
+          {linkedAcc ? (
+            <input type="text" disabled className={inputCls+" opacity-70 cursor-not-allowed"} value={fmt(Math.max(0,-(linkedAcc.balance||0)))}/>
+          ) : (
+            <input type="number" step="0.01" className={inputCls} value={f.totalValue} onChange={e=>set('totalValue', e.target.value)} placeholder="Ej. 350"/>
+          )}
         </Field>
-      </div>
+      ) : (
+        <div className="grid grid-cols-2 gap-4">
+          <Field label={f.noEndDate ? "Saldo actual (€)" : "Valor total (€)"}>
+            <input type="number" step="0.01" className={inputCls} value={f.totalValue} onChange={e=>set('totalValue', e.target.value)} placeholder={f.noEndDate ? "Ej. 350" : "Opcional"}/>
+          </Field>
+          <Field label={f.noEndDate ? "Pago mínimo mensual (€)" : "Cuota mensual (€)"}>
+            <input type="number" step="0.01" className={inputCls} value={f.monthlyPayment} onChange={e=>set('monthlyPayment', e.target.value)} required/>
+          </Field>
+        </div>
+      )}
+      {isCC && (
+        <div className="grid grid-cols-3 gap-4 bg-paper-200/60 dark:bg-ink-600/40 rounded-xl p-3">
+          <Field label="% interés mensual">
+            <input type="number" step="0.01" className={inputCls} value={f.interestRate} onChange={e=>set('interestRate', e.target.value)} placeholder="Ej. 1.75"/>
+          </Field>
+          <Field label="% pago mínimo">
+            <input type="number" step="0.1" className={inputCls} value={f.minPaymentPercent} onChange={e=>set('minPaymentPercent', e.target.value)} placeholder="3"/>
+          </Field>
+          <Field label="Mínimo en €">
+            <input type="number" step="0.01" className={inputCls} value={f.minPaymentFloor} onChange={e=>set('minPaymentFloor', e.target.value)} placeholder="30"/>
+          </Field>
+          <p className="col-span-3 text-xs text-gray-500 -mt-1">
+            Pago mínimo con estos números: <span className="font-mono text-ink-900 dark:text-gray-100 font-medium">{fmt(creditCardMinPayment({ totalValue: Number(f.totalValue)||0, minPaymentPercent: Number(f.minPaymentPercent)||3, minPaymentFloor: Number(f.minPaymentFloor)||30 }))}</span> — se recalcula solo cada vez que cambie el saldo.
+          </p>
+        </div>
+      )}
 
       {!f.noEndDate && (
         <div className="grid grid-cols-2 gap-4">
@@ -1111,11 +1231,163 @@ function DebtForm({ initial, accounts, onSave, onClose }) {
         {!f.noEndDate && <p className="text-xs text-gray-500 mt-1.5">{f.mode==='auto' ? 'Las cuotas avanzan solas según la fecha de pago, sin que tengas que marcarlas.' : 'Tú marcas cada cuota como pagada manualmente.'}</p>}
       </Field>
 
+      {isCC && (
+        <Field label="Día de cobro del interés">
+          <input type="number" min="1" max="31" className={inputCls} value={f.interestDay} onChange={e=>set('interestDay', e.target.value)}/>
+          <p className="text-xs text-gray-500 mt-1.5">Si al pagar (en manual o automático) queda algo pendiente, el interés se cobra solo ese día — sobre la próxima fecha en que caiga, aunque ya haya pasado este mes. Puedes adelantarte y pagarlo tú antes desde la tarjeta.</p>
+        </Field>
+      )}
+
+      {isCC && f.mode==='auto' && (
+        <div className="flex flex-col gap-3 bg-paper-200/60 dark:bg-ink-600/40 rounded-xl p-3">
+          <Field label="Día de pago (débito automático)">
+            <input type="number" min="1" max="31" className={inputCls} value={f.paymentDay} onChange={e=>set('paymentDay', e.target.value)}/>
+          </Field>
+          <p className="text-xs text-gray-500 -mt-1">Ese día se descuenta solo lo que elijas abajo.</p>
+
+          <div className="flex flex-col gap-2">
+            <button type="button" onClick={()=>set('autoPaymentMode','minimum')}
+              className={`text-left rounded-xl p-3 border transition ${f.autoPaymentMode==='minimum' ? 'border-gold-500 bg-gold-500/10' : 'border-paper-300 dark:border-ink-500 bg-white dark:bg-ink-700 hover:border-gold-500/50'}`}>
+              <div className="font-medium text-sm text-ink-900 dark:text-gray-100">Importe mínimo</div>
+              <p className="text-xs text-gray-500 mt-1">Cada ciclo se cobra solo el {f.minPaymentPercent||3}% del total debido (con tu mínimo en €).</p>
+            </button>
+            <button type="button" onClick={()=>set('autoPaymentMode','custom')}
+              className={`text-left rounded-xl p-3 border transition ${f.autoPaymentMode==='custom' ? 'border-gold-500 bg-gold-500/10' : 'border-paper-300 dark:border-ink-500 bg-white dark:bg-ink-700 hover:border-gold-500/50'}`}>
+              <div className="font-medium text-sm text-ink-900 dark:text-gray-100">Importe personalizado</div>
+              <p className="text-xs text-gray-500 mt-1 mb-2">El mismo monto fijo se cobra solo cada ciclo — como "Preleva questo importo mensilmente".</p>
+              {f.autoPaymentMode==='custom' && (
+                <input type="number" step="0.01" className={inputCls} value={f.autoCustomAmount} onChange={e=>set('autoCustomAmount', e.target.value)} onClick={e=>e.stopPropagation()} placeholder="Ej. 55"/>
+              )}
+            </button>
+            <button type="button" onClick={()=>set('autoPaymentMode','total')}
+              className={`text-left rounded-xl p-3 border transition ${f.autoPaymentMode==='total' ? 'border-gold-500 bg-gold-500/10' : 'border-paper-300 dark:border-ink-500 bg-white dark:bg-ink-700 hover:border-gold-500/50'}`}>
+              <div className="font-medium text-sm text-ink-900 dark:text-gray-100">Importe total</div>
+              <p className="text-xs text-gray-500 mt-1">Se cobra solo el total debido cada ciclo — nunca genera intereses.</p>
+            </button>
+          </div>
+        </div>
+      )}
+
       <AccountField accounts={accounts} value={f.accountId} onChange={(v)=>set('accountId', v)}/>
 
       <div className="flex justify-end gap-2 mt-2">
         <button type="button" onClick={onClose} className="px-4 py-2 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Cancelar</button>
         <button type="submit" className="px-4 py-2 rounded-lg bg-gold-500 hover:bg-gold-600 text-ink-900 font-medium transition">Guardar deuda</button>
+      </div>
+    </form>
+  );
+}
+
+// pantalla de pago de tarjeta de crédito: importe mínimo / personalizado / total, con vista previa
+// en vivo de los intereses (si no pagas el total, el resto se le suma el interés de este ciclo)
+function CreditCardPaymentForm({ debt, onSave, onClose }) {
+  const [mode, setMode] = useState('minimum'); // 'minimum' | 'custom' | 'total'
+  const [customAmount, setCustomAmount] = useState('');
+  const [rateDraft, setRateDraft] = useState(debt.interestRate!=null ? String(debt.interestRate) : '');
+  const rate = Number(rateDraft) || 0;
+  const debtForCalc = { ...debt, interestRate: rate }; // la tasa puede cambiar de un ciclo a otro, así que se ajusta aquí mismo
+  const minPayment = Math.round(creditCardMinPayment(debtForCalc) * 100) / 100;
+  const amount = mode==='minimum' ? minPayment : mode==='total' ? (debt.totalValue||0) : (Number(customAmount) || 0);
+  const sim = simulateCreditCardPayment(debtForCalc, amount);
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (amount <= 0) return;
+    onSave(amount, rate);
+  };
+
+  return (
+    <form onSubmit={submit} className="flex flex-col gap-4">
+      <div className="bg-paper-200 dark:bg-ink-600 rounded-xl px-3 py-2.5 flex justify-between text-sm">
+        <span className="text-gray-500">Importe total debido</span>
+        <span className="font-mono font-medium text-ink-900 dark:text-gray-100">{fmt(debt.totalValue||0)}</span>
+      </div>
+
+      <Field label="% de interés mensual (editable — puede cambiar cada ciclo)">
+        <input type="number" step="0.01" className={inputCls} value={rateDraft} onChange={e=>setRateDraft(e.target.value)} placeholder="Ej. 1.75"/>
+      </Field>
+
+      <div className="flex flex-col gap-2">
+        <button type="button" onClick={()=>setMode('minimum')}
+          className={`text-left rounded-xl p-3 border transition ${mode==='minimum' ? 'border-gold-500 bg-gold-500/10' : 'border-paper-300 dark:border-ink-500 hover:border-gold-500/50'}`}>
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-medium text-sm text-ink-900 dark:text-gray-100">Importe mínimo</span>
+            <span className="font-mono text-sm text-ink-900 dark:text-gray-100">{fmt(minPayment)}</span>
+          </div>
+          <p className="text-xs text-gray-500 mt-1">El {debt.minPaymentPercent||3}% del total debido, con un mínimo de {fmt(debt.minPaymentFloor||30)}.</p>
+        </button>
+
+        <button type="button" onClick={()=>setMode('custom')}
+          className={`text-left rounded-xl p-3 border transition ${mode==='custom' ? 'border-gold-500 bg-gold-500/10' : 'border-paper-300 dark:border-ink-500 hover:border-gold-500/50'}`}>
+          <div className="font-medium text-sm text-ink-900 dark:text-gray-100">Importe personalizado</div>
+          <p className="text-xs text-gray-500 mt-1 mb-2">Elige tú cuánto pagar de esta deuda.</p>
+          {mode==='custom' && (
+            <input type="number" step="0.01" autoFocus className={inputCls} value={customAmount}
+              onChange={e=>setCustomAmount(e.target.value)} onClick={e=>e.stopPropagation()} placeholder="Ej. 55"/>
+          )}
+        </button>
+
+        <button type="button" onClick={()=>setMode('total')}
+          className={`text-left rounded-xl p-3 border transition ${mode==='total' ? 'border-gold-500 bg-gold-500/10' : 'border-paper-300 dark:border-ink-500 hover:border-gold-500/50'}`}>
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-medium text-sm text-ink-900 dark:text-gray-100">Importe total</span>
+            <span className="font-mono text-sm text-ink-900 dark:text-gray-100">{fmt(debt.totalValue||0)}</span>
+          </div>
+          <p className="text-xs text-gray-500 mt-1">Pagar el importe total debido — sin intereses.</p>
+        </button>
+      </div>
+
+      {amount>0 && (
+        sim.isFullPayment ? (
+          <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-xl p-3 text-sm text-emerald-400">
+            Pagas el total — no se genera ningún interés.
+          </div>
+        ) : (
+          <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-3 text-sm flex flex-col gap-1">
+            <div className="flex justify-between"><span className="text-gray-500">Queda pendiente (saldo tras este pago)</span><span className="font-mono text-ink-900 dark:text-gray-100">{fmt(sim.remaining)}</span></div>
+            <div className="flex justify-between"><span className="text-gray-500">Interés estimado ({rate}%)</span><span className="font-mono text-red-400">≈ +{fmt(sim.interest)}</span></div>
+            <p className="text-xs text-gray-500 mt-1">No se cobra ahora — se cobrará solo el día {debt.interestDay||15} sobre el saldo que quede en ese momento, a menos que lo pagues tú antes desde la tarjeta.</p>
+          </div>
+        )
+      )}
+
+      <div className="flex justify-end gap-2 mt-2">
+        <button type="button" onClick={onClose} className="px-4 py-2 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Cancelar</button>
+        <button type="submit" disabled={amount<=0} className="px-4 py-2 rounded-lg bg-gold-500 hover:bg-gold-600 text-ink-900 font-medium transition disabled:opacity-50">Continuar</button>
+      </div>
+    </form>
+  );
+}
+
+// pagar el interés adelantado: deja editar el % justo antes de confirmar, igual que en el pago
+// normal — porque la tasa puede no ser fija.
+function PayInterestNowForm({ debt, onSave, onSaveRate, onClose }) {
+  const [rateDraft, setRateDraft] = useState(debt.interestRate!=null ? String(debt.interestRate) : '');
+  const rate = Number(rateDraft) || 0;
+  const rateChanged = rate !== (debt.interestRate||0);
+  const interest = (debt.totalValue||0)>0.01 ? Math.round((debt.totalValue||0) * (rate/100) * 100)/100 : 0;
+  const submit = (e) => {
+    e.preventDefault();
+    onSave(rate);
+  };
+  return (
+    <form onSubmit={submit} className="flex flex-col gap-4">
+      <div className="bg-paper-200 dark:bg-ink-600 rounded-xl px-3 py-2.5 flex justify-between text-sm">
+        <span className="text-gray-500">Saldo actual</span>
+        <span className="font-mono font-medium text-ink-900 dark:text-gray-100">{fmt(debt.totalValue||0)}</span>
+      </div>
+      <Field label="% de interés mensual (editable — puede cambiar cada ciclo)">
+        <input type="number" step="0.01" autoFocus className={inputCls} value={rateDraft} onChange={e=>setRateDraft(e.target.value)} placeholder="Ej. 1.75"/>
+      </Field>
+      <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl p-3 text-sm flex justify-between">
+        <span className="text-gray-500">Interés que se suma ahora</span>
+        <span className="font-mono text-orange-500 font-medium">{fmt(interest)}</span>
+      </div>
+      <p className="text-xs text-gray-500 -mt-2">Esto sube el saldo de la tarjeta — es lo mismo que pasaría solo el día {debt.interestDay||15}, solo que lo confirmas tú ahora en vez de esperar. Si solo quieres actualizar el % para cuando se cobre solo (sin pagarlo ahora), usa "Guardar %" en vez de "Pagar interés".</p>
+      <div className="flex justify-end gap-2 mt-2 flex-wrap">
+        <button type="button" onClick={onClose} className="px-4 py-2 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Cancelar</button>
+        <button type="button" disabled={!rateChanged} onClick={()=>onSaveRate(rate)} className="px-4 py-2 rounded-lg border border-gold-500 text-gold-500 hover:bg-gold-500/10 font-medium transition disabled:opacity-40 disabled:cursor-not-allowed">Guardar %</button>
+        <button type="submit" className="px-4 py-2 rounded-lg bg-gold-500 hover:bg-gold-600 text-ink-900 font-medium transition">Pagar interés</button>
       </div>
     </form>
   );
@@ -1948,6 +2220,80 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     // eslint-disable-next-line
   }, [loaded]);
 
+  // tarjetas de crédito: el cobro automático del PAGO solo aplica en modo automático (día de pago).
+  // El cobro automático del INTERÉS aplica a CUALQUIER tarjeta de crédito (manual o automática) que
+  // haya quedado con algo pendiente — se cobra solo el día que configuraste, sobre el saldo que
+  // quede en ese momento, a menos que ya lo hayas pagado tú antes con "Pagar interés ahora".
+  useEffect(() => {
+    if (!loaded) return;
+    const now = new Date();
+    const today = now.getDate();
+    const curKey = currentMonthKey();
+    const accountDeltas = [];
+    let anyChange = false;
+
+    const updated = debts.map(d => {
+      if (!d.isCreditCard || d.finished) return d;
+      const cycles = { ...(d.ccCycles||{}) };
+      const cyc = { pending:false, paymentDone:false, paymentAmount:0, paymentDate:null, interestDone:false, interestAmount:0, interestDate:null, ...(cycles[curKey]||{}) };
+      let totalValue = creditCardBalance(d, accounts);
+      let changed = false;
+      const newPayments = [];
+      let futureCycles = null;
+
+      if (d.mode==='auto' && !cyc.paymentDone && today >= (d.paymentDay||3)) {
+        const amount = d.autoPaymentMode==='total' ? totalValue
+          : d.autoPaymentMode==='custom' ? Math.min(d.autoCustomAmount||0, totalValue)
+          : Math.round(creditCardMinPayment({ ...d, totalValue })*100)/100;
+        if (amount > 0) {
+          totalValue = Math.round((totalValue - amount)*100)/100;
+          if (d.accountId) accountDeltas.push({ accountId:d.accountId, delta:-amount });
+          if (d.linkedBalanceAccountId) accountDeltas.push({ accountId:d.linkedBalanceAccountId, delta:amount });
+          newPayments.push({ date: todayISO(), amount, interest:0, balanceAfter: totalValue, auto:true, kind:'payment' });
+        }
+        cyc.paymentDone = true;
+        cyc.paymentAmount = amount;
+        cyc.paymentDate = todayISO();
+        changed = true;
+        if (totalValue > 0.01) {
+          const interestKey = nextInterestCycleKey(d.interestDay);
+          if (interestKey === curKey) {
+            cyc.pending = true; // el día de interés cae este mismo mes: se marca directo en el ciclo actual
+          } else {
+            const existing = cycles[interestKey] || {};
+            futureCycles = { [interestKey]: { pending:false, paymentDone:false, paymentAmount:0, paymentDate:null, interestDone:false, interestAmount:0, interestDate:null, ...existing, pending:true } };
+          }
+        }
+      }
+
+      if (cyc.pending && !cyc.interestDone && today >= (d.interestDay||15)) {
+        let interest = 0;
+        if (totalValue > 0.01) {
+          interest = Math.round(totalValue * ((d.interestRate||0)/100) * 100) / 100;
+          totalValue = Math.round((totalValue + interest)*100)/100;
+          if (d.linkedBalanceAccountId) accountDeltas.push({ accountId:d.linkedBalanceAccountId, delta:-interest });
+          newPayments.push({ date: todayISO(), amount:0, interest, balanceAfter: totalValue, auto:true, kind:'interest' });
+        }
+        cyc.interestDone = true;
+        cyc.interestAmount = interest;
+        cyc.interestDate = todayISO();
+        changed = true;
+      }
+
+      if (!changed) return d;
+      anyChange = true;
+      cycles[curKey] = cyc;
+      if (futureCycles) Object.assign(cycles, futureCycles);
+      return { ...d, totalValue, ccCycles: cycles, payments: [...(d.payments||[]), ...newPayments] };
+    });
+
+    if (anyChange) {
+      setDebts(updated);
+      if (accountDeltas.length) applyBalanceDeltas(accountDeltas);
+    }
+    // eslint-disable-next-line
+  }, [loaded]);
+
   const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark');
 
   /* ---------- acciones CRUD ---------- */
@@ -2243,6 +2589,153 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   };
   const markDebtCyclePaid = (id) => setDebts(l => l.map(d => d.id===id ? {...d, lastPaid: todayISO()} : d));
 
+  // pago de tarjeta de crédito (manual, desde el botón "Pagar tarjeta"): el monto pagado se resta
+  // del saldo YA. Si quedó algo pendiente, el interés se agenda para cobrarse solo el día que
+  // configuraste (o antes, si lo pagas tú con "Pagar interés ahora") — igual sea cual sea el modo.
+  // Si la tarjeta está unida a una cuenta (ej. "YOU"), esa cuenta lleva el saldo en negativo, así
+  // que pagar la sube (la hace menos negativa) exactamente lo mismo que baja el saldo de la deuda.
+  const payCreditCard = (debtId, amount, rate) => {
+    const d = debts.find(x=>x.id===debtId);
+    if (!d) return;
+    const currentBalance = creditCardBalance(d, accounts);
+    const paid = Math.max(0, Math.min(amount, currentBalance));
+    const remaining = Math.round((currentBalance - paid)*100)/100;
+    const isFull = remaining <= 0.01;
+    const newBalance = isFull ? 0 : remaining;
+    const newRate = rate!=null ? rate : d.interestRate;
+    let cycles = { ...(d.ccCycles||{}) };
+    let pendingKeySet = null; // qué ciclo de interés quedó agendado por ESTE pago (para poder deshacerlo)
+    if (!isFull) {
+      const key = nextInterestCycleKey(d.interestDay);
+      const existing = cycles[key] || {};
+      const wasAlreadyPending = !!existing.pending;
+      cycles = { ...cycles, [key]: { paymentDone:false, paymentAmount:0, paymentDate:null, interestDone:false, interestAmount:0, interestDate:null, ...existing, pending:true } };
+      if (!wasAlreadyPending) pendingKeySet = key;
+    }
+    setDebts(list => list.map(x => x.id===debtId ? {
+      ...x,
+      totalValue: newBalance,
+      monthlyPayment: Math.round(creditCardMinPayment({ ...x, totalValue: newBalance })*100)/100,
+      interestRate: newRate,
+      lastPaid: todayISO(),
+      ccCycles: cycles,
+      payments: [...(x.payments||[]), { date: todayISO(), amount: paid, interest: 0, balanceAfter: newBalance, auto:false, kind:'payment', pendingKeySet }],
+    } : x));
+    const deltas = [];
+    if (d.accountId && paid > 0) deltas.push({ accountId: d.accountId, delta: -paid });
+    if (d.linkedBalanceAccountId && paid > 0) deltas.push({ accountId: d.linkedBalanceAccountId, delta: paid });
+    if (deltas.length) applyBalanceDeltas(deltas);
+    setModal(null);
+  };
+
+  // deshacer el ÚLTIMO pago manual de tarjeta — solo si fue hoy (el mismo criterio que el resto de
+  // la app). Devuelve el dinero a la cuenta, vuelve a subir el saldo de la tarjeta (y baja de nuevo
+  // la cuenta unida, si tiene), y si ese pago había agendado un interés pendiente sin resolver,
+  // también lo quita.
+  const undoCreditCardManualPayment = (debtId) => {
+    const d = debts.find(x=>x.id===debtId);
+    if (!d) return;
+    const payments = d.payments || [];
+    const last = payments[payments.length-1];
+    if (!last || last.kind!=='payment' || last.auto || last.date!==todayISO()) return;
+    const restoredBalance = Math.round((creditCardBalance(d, accounts) + last.amount)*100)/100;
+    let cycles = { ...(d.ccCycles||{}) };
+    if (last.pendingKeySet && cycles[last.pendingKeySet] && cycles[last.pendingKeySet].pending && !cycles[last.pendingKeySet].interestDone) {
+      cycles = { ...cycles, [last.pendingKeySet]: { ...cycles[last.pendingKeySet], pending:false } };
+    }
+    setDebts(list => list.map(x => x.id===debtId ? {
+      ...x,
+      totalValue: restoredBalance,
+      monthlyPayment: Math.round(creditCardMinPayment({ ...x, totalValue: restoredBalance })*100)/100,
+      ccCycles: cycles,
+      payments: payments.slice(0, -1),
+      lastPaid: null, // si no, la etiqueta "Pagado" de arriba se queda pegada aunque el pago ya no exista
+    } : x));
+    const deltas = [];
+    if (d.accountId && last.amount > 0) deltas.push({ accountId: d.accountId, delta: last.amount });
+    if (d.linkedBalanceAccountId && last.amount > 0) deltas.push({ accountId: d.linkedBalanceAccountId, delta: -last.amount });
+    if (deltas.length) applyBalanceDeltas(deltas);
+  };
+
+  // tarjeta de crédito: el interés SIEMPRE sube el saldo — tanto si lo pagas tú adelantado (aquí)
+  // como si se cobra solo el día que configuraste. La diferencia es solo el momento en que se
+  // calcula. Si la tarjeta está unida a una cuenta, esa cuenta se pone más negativa por lo mismo
+  // (no sale dinero de ninguna OTRA cuenta — el interés no es un pago aparte, es deuda que crece).
+  // guarda solo el % de interés nuevo, sin pagar/cobrar nada ahora — para cuando quieres corregir
+  // la tasa de antemano y que el cobro automático (o el próximo pago) ya la use.
+  const updateCreditCardRate = (debtId, rate) => {
+    setDebts(list => list.map(x => x.id===debtId ? { ...x, interestRate: rate } : x));
+  };
+
+  const payCreditCardInterestNow = (debtId, rate) => {
+    const d = debts.find(x=>x.id===debtId);
+    if (!d) return;
+    const newRate = rate!=null ? rate : d.interestRate;
+    const found = findPendingInterestCycle(d);
+    const key = found ? found.key : nextInterestCycleKey(d.interestDay);
+    const cyc = { pending:true, paymentDone:false, paymentAmount:0, paymentDate:null, interestDone:false, interestAmount:0, interestDate:null, ...(found ? found.cyc : {}) };
+    if (cyc.interestDone) return; // ya está cobrado
+    const currentBalance = creditCardBalance(d, accounts);
+    const interest = currentBalance>0.01 ? Math.round(currentBalance * ((newRate||0)/100) * 100)/100 : 0;
+    const newBalance = Math.round((currentBalance + interest)*100)/100;
+    cyc.interestDone = true;
+    cyc.interestAmount = interest;
+    cyc.interestDate = todayISO();
+    const cycles = { ...(d.ccCycles||{}), [key]: cyc };
+    setDebts(list => list.map(x => x.id===debtId ? {
+      ...x,
+      totalValue: newBalance,
+      monthlyPayment: Math.round(creditCardMinPayment({ ...x, totalValue: newBalance })*100)/100,
+      interestRate: newRate,
+      ccCycles: cycles,
+      payments: [...(x.payments||[]), { date: todayISO(), amount:0, interest, balanceAfter:newBalance, auto:false, kind:'interest' }],
+    } : x));
+    if (d.linkedBalanceAccountId && interest > 0) applyBalanceDeltas([{ accountId: d.linkedBalanceAccountId, delta: -interest }]);
+    setModal(null);
+  };
+
+  // deshacer el pago automático de este ciclo (día de pago): devuelve el dinero a la cuenta y
+  // vuelve a subir el saldo de la tarjeta, como si nunca se hubiera cobrado.
+  const undoCreditCardPayment = (debtId) => {
+    const d = debts.find(x=>x.id===debtId);
+    if (!d) return;
+    const key = currentMonthKey();
+    const cyc = (d.ccCycles||{})[key];
+    if (!cyc || !cyc.paymentDone) return;
+    const restoredBalance = Math.round((creditCardBalance(d, accounts) + cyc.paymentAmount)*100)/100;
+    const cycles = { ...d.ccCycles, [key]: { ...cyc, paymentDone:false, paymentAmount:0, paymentDate:null } };
+    setDebts(list => list.map(x => x.id===debtId ? {
+      ...x,
+      totalValue: restoredBalance,
+      monthlyPayment: Math.round(creditCardMinPayment({ ...x, totalValue: restoredBalance })*100)/100,
+      ccCycles: cycles,
+    } : x));
+    const deltas = [];
+    if (d.accountId && cyc.paymentAmount > 0) deltas.push({ accountId: d.accountId, delta: cyc.paymentAmount });
+    if (d.linkedBalanceAccountId && cyc.paymentAmount > 0) deltas.push({ accountId: d.linkedBalanceAccountId, delta: -cyc.paymentAmount });
+    if (deltas.length) applyBalanceDeltas(deltas);
+  };
+
+  // deshacer el interés cobrado o pagado adelantado HOY (busca en cualquier ciclo, no solo el mes
+  // actual) — como el interés ahora siempre sube el saldo, deshacer siempre se lo resta de vuelta
+  // (y a la cuenta unida, si tiene, se lo devuelve haciéndola menos negativa).
+  const undoCreditCardInterest = (debtId) => {
+    const d = debts.find(x=>x.id===debtId);
+    if (!d) return;
+    const entry = Object.entries(d.ccCycles||{}).find(([k,c]) => c.interestDone && c.interestDate===todayISO());
+    if (!entry) return;
+    const [key, cyc] = entry;
+    const newBalance = Math.max(0, Math.round((creditCardBalance(d, accounts) - cyc.interestAmount)*100)/100);
+    const cycles = { ...d.ccCycles, [key]: { ...cyc, interestDone:false, interestAmount:0, interestDate:null } };
+    setDebts(list => list.map(x => x.id===debtId ? {
+      ...x,
+      totalValue: newBalance,
+      monthlyPayment: Math.round(creditCardMinPayment({ ...x, totalValue: newBalance })*100)/100,
+      ccCycles: cycles,
+    } : x));
+    if (d.linkedBalanceAccountId && cyc.interestAmount > 0) applyBalanceDeltas([{ accountId: d.linkedBalanceAccountId, delta: cyc.interestAmount }]);
+  };
+
   // arrastrar en el Calendario: reprograma a qué DÍA de ESE mismo mes corresponde una ocurrencia.
   // Si esa ocurrencia ya tenía dinero de verdad descontado, se devuelve (como "Cancelar cargo") y
   // se desmarca como pagada — queda pendiente en el día nuevo, sin volver a descontarse ella sola.
@@ -2375,6 +2868,12 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const today = todayISO();
 
     debts.forEach(d => {
+      // las tarjetas de crédito tienen su propio sistema completo (payCreditCard, el motor de
+      // interés, ccCycles) que ya mueve el saldo de la cuenta por su cuenta — si además pasaran
+      // por este motor genérico (que también mira "lastPaid" para saber si ya se pagó), la cuenta
+      // se descontaría DOS VECES por el mismo pago, y "Cancelar" desde la cuenta solo revertiría
+      // una de las dos, dejando todo descuadrado. Por eso quedan fuera de aquí.
+      if (d.isCreditCard) return;
       if (!d.accountId || d.finished) return;
       const first = new Date(d.firstPaymentDate);
       const firstIdx = first.getFullYear()*12 + first.getMonth();
@@ -2847,6 +3346,9 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
               {view==='debts' && (
                 <DebtsView debts={debts} accounts={accounts} onAdd={()=>setModal({type:'debt'})} onEdit={(d)=>setModal({type:'debt', item:d})}
                   onDelete={(d)=>setConfirmDel({type:'debt', id:d.id, name:d.name})} onPay={payInstallment} onUndo={undoInstallment} onFinish={finishDebt} onMarkCyclePaid={markDebtCyclePaid}
+                  onPayCreditCard={(d)=>setModal({type:'creditCardPayment', item:d})}
+                  onPayCreditCardInterestNow={(d)=>setModal({type:'creditCardInterestNow', item:d})} onUndoCreditCardPayment={undoCreditCardPayment} onUndoCreditCardInterest={undoCreditCardInterest}
+                  onUndoCreditCardManualPayment={undoCreditCardManualPayment}
                   totalMonthly={totalDebtMonthly} activeCount={activeDebts.length} notStarted={debtsNotStarted} pending={debtsPendingThisMonth}/>
               )}
               {view==='subs' && (
@@ -2957,6 +3459,8 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
 
         {/* MODALES */}
         {modal?.type==='debt' && <Modal title={modal.item? 'Editar deuda':'Nueva deuda'} onClose={()=>setModal(null)}><DebtForm initial={modal.item} accounts={accounts} onSave={upsertDebt} onClose={()=>setModal(null)}/></Modal>}
+        {modal?.type==='creditCardPayment' && <Modal title={`Pagar ${modal.item.name}`} onClose={()=>setModal(null)}><CreditCardPaymentForm debt={modal.item} onSave={(amount, rate)=>payCreditCard(modal.item.id, amount, rate)} onClose={()=>setModal(null)}/></Modal>}
+        {modal?.type==='creditCardInterestNow' && <Modal title={`Pagar interés — ${modal.item.name}`} onClose={()=>setModal(null)}><PayInterestNowForm debt={modal.item} onSave={(rate)=>payCreditCardInterestNow(modal.item.id, rate)} onSaveRate={(rate)=>{updateCreditCardRate(modal.item.id, rate); setModal(null);}} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='sub' && <Modal title={modal.item? 'Editar suscripción':'Nueva suscripción'} onClose={()=>setModal(null)}><SubscriptionForm initial={modal.item} accounts={accounts} onSave={upsertSub} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='fixed' && <Modal title={modal.item? 'Editar gasto fijo':'Nuevo gasto fijo'} onClose={()=>setModal(null)}><FixedForm initial={modal.item} accounts={accounts} onSave={upsertFixed} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='project' && <Modal title={modal.item? 'Editar proyecto':'Nuevo proyecto de ahorro'} onClose={()=>setModal(null)}><SavingsProjectForm initial={modal.item} accounts={accounts} onSave={upsertProject} onClose={()=>setModal(null)}/></Modal>}
@@ -2998,7 +3502,6 @@ function NavItem({ icon, label, active, onClick, count, collapsed }) {
       ${active ? 'bg-gold-500/15 text-gold-500 font-medium' : 'text-gray-500 dark:text-gray-400 hover:text-ink-900 dark:hover:text-gray-100 hover:bg-paper-200/60 dark:hover:bg-ink-600/50'}`}>
       {icon}
       {!collapsed && <span className="flex-1 text-left">{label}</span>}
-      {!collapsed && typeof count === 'number' && count>0 && <span className="font-mono text-gray-500 dark:text-gray-500">{count}</span>}
     </button>
   );
 }
@@ -3165,7 +3668,7 @@ function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDe
 /* =========================================================================
    DEUDAS
    ========================================================================= */
-function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, onFinish, onMarkCyclePaid, totalMonthly, activeCount, notStarted, pending }) {
+function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, onFinish, onMarkCyclePaid, onPayCreditCard, onPayCreditCardInterestNow, onUndoCreditCardPayment, onUndoCreditCardInterest, onUndoCreditCardManualPayment, totalMonthly, activeCount, notStarted, pending }) {
   const [q, setQ] = useState('');
   const [filter, setFilter] = useState('activas');
   const filtered = debts.filter(d => {
@@ -3199,7 +3702,8 @@ function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, on
         {filtered.map(d => {
           const paid = effectivePaid(d);
           const pct = d.noEndDate ? null : Math.round((paid/d.totalInstallments)*100);
-          const pending = d.noEndDate ? d.totalValue : (d.totalInstallments-paid)*d.monthlyPayment;
+          const ccLive = d.isCreditCard ? creditCardBalance(d, accounts) : null;
+          const pending = d.noEndDate ? (d.isCreditCard ? ccLive : d.totalValue) : (d.totalInstallments-paid)*d.monthlyPayment;
           const daysUntil = d.finished ? null : nextDebtOccurrence(d).daysUntil;
           const nextDate = d.finished ? null : nextDebtOccurrence(d).date;
           const cyclePaid = d.noEndDate && !d.finished && isPaidThisCycle(d);
@@ -3232,7 +3736,7 @@ function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, on
                       </span>
                       <AccountBadge accountId={d.accountId} accounts={accounts}/>
                     </div>
-                    <div className="text-gray-500 dark:text-gray-500">{nextDate ? `Próx. pago: ${nextDate.toLocaleDateString('es-ES',{day:'numeric',month:'short'})}` : `Día ${d.paymentDay} de cada mes`} · {fmt(d.monthlyPayment)}/mes{d.noEndDate && ' · Sin fecha límite'}</div>
+                    <div className="text-gray-500 dark:text-gray-500">{nextDate ? `Próx. pago: ${nextDate.toLocaleDateString('es-ES',{day:'numeric',month:'short'})}` : `Día ${d.paymentDay} de cada mes`} · {fmt(d.monthlyPayment)}/mes{d.noEndDate && (d.isCreditCard ? ' · Tarjeta de crédito' : ' · Sin fecha límite')}</div>
                   </div>
                 </div>
                 <div className="flex flex-col items-end gap-1.5">
@@ -3248,7 +3752,14 @@ function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, on
 
               <div className="flex items-center justify-between text-gray-500 dark:text-gray-500">
                 {d.noEndDate ? (
-                  <span className="font-mono">Saldo actual</span>
+                  <span className="font-mono flex items-center gap-1.5">
+                    Saldo actual
+                    {d.isCreditCard && <span className="text-[10px] uppercase text-gold-500 border border-gold-500/40 rounded-full px-1.5 py-0.5">{d.interestRate||0}% interés</span>}
+                    {d.isCreditCard && d.linkedBalanceAccountId && (() => {
+                      const la = accounts.find(a=>a.id===d.linkedBalanceAccountId);
+                      return la ? <span className="text-[10px] uppercase text-gray-500 border border-paper-300 dark:border-ink-500 rounded-full px-1.5 py-0.5">🔗 {la.emoji} {la.name}</span> : null;
+                    })()}
+                  </span>
                 ) : (
                   <span className="font-mono">{pct}% · {paid} de {d.totalInstallments} cuotas pagadas</span>
                 )}
@@ -3263,6 +3774,67 @@ function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, on
 
               {d.finished ? (
                 <div className="flex items-center gap-2 text-sm mt-1"><ICheck size={16}/> Finalizada el {d.finishedDate}</div>
+              ) : d.isCreditCard ? (
+                <div className="flex flex-col gap-2 mt-1">
+                  {d.mode==='auto' ? (() => {
+                    const cyc = (d.ccCycles||{})[currentMonthKey()] || { paymentDone:false, paymentAmount:0, paymentDate:null };
+                    const paymentToday = cyc.paymentDate === todayISO();
+                    return cyc.paymentDone ? (
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="flex items-center gap-1.5 text-emerald-400 text-xs"><ICheck size={13}/> Pagado {fmt(cyc.paymentAmount)}</span>
+                        {paymentToday && <button onClick={()=>onUndoCreditCardPayment(d.id)} className="px-2 py-1 rounded-lg text-xs text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Deshacer</button>}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-gray-500 flex items-center gap-1.5"><IBolt size={13} className="text-gold-500"/> Se cobra solo el día {d.paymentDay||3}.</div>
+                    );
+                  })() : (() => {
+                    const lastP = d.payments && d.payments[d.payments.length-1];
+                    const paidTodayManual = lastP && lastP.kind==='payment' && !lastP.auto && lastP.date===todayISO();
+                    if (paidTodayManual) {
+                      return (
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="flex items-center gap-1.5 text-emerald-400 text-xs"><ICheck size={13}/> Pagado {fmt(lastP.amount)}</span>
+                          <button onClick={()=>onUndoCreditCardManualPayment(d.id)} className="px-2 py-1 rounded-lg text-xs text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Deshacer</button>
+                        </div>
+                      );
+                    }
+                    return ccLive<=0 ? (
+                      <div className="flex items-center gap-1.5 text-emerald-400 text-xs"><ICheck size={13}/> Sin saldo pendiente</div>
+                    ) : (
+                      <button onClick={()=>onPayCreditCard({...d, totalValue: ccLive})} className="flex items-center justify-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-sm font-medium py-2 rounded-lg transition">
+                        <ICard size={15}/> Pagar tarjeta
+                      </button>
+                    );
+                  })()}
+
+                  {(() => {
+                    // el interés pendiente puede vivir en un ciclo de un mes distinto al actual
+                    // (si pagaste ahora pero el día de interés cae más adelante)
+                    const pendingEntry = findPendingInterestCycle(d);
+                    if (pendingEntry) {
+                      return (
+                        <div className="flex items-center justify-between gap-2 bg-orange-500/10 rounded-lg px-2 py-1.5">
+                          <span className="text-orange-500 text-xs">Aún por pagar el interés</span>
+                          <button onClick={()=>onPayCreditCardInterestNow({...d, totalValue: ccLive})} className="text-xs text-gold-500 hover:underline shrink-0">Pagar interés ahora</button>
+                        </div>
+                      );
+                    }
+                    const resolvedToday = Object.values(d.ccCycles||{}).find(c => c.interestDone && c.interestDate===todayISO());
+                    if (resolvedToday) {
+                      return (
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="flex items-center gap-1.5 text-emerald-400 text-xs"><ICheck size={13}/> Interés: Pagado{resolvedToday.interestAmount>0 ? ` (${fmt(resolvedToday.interestAmount)})` : ''}</span>
+                          <button onClick={()=>onUndoCreditCardInterest(d.id)} className="px-2 py-1 rounded-lg text-xs text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Deshacer</button>
+                        </div>
+                      );
+                    }
+                    return null;
+                  })()}
+
+                  {d.payments && d.payments.length>0 && (
+                    <div className="text-xs text-gray-500">Último movimiento: {fmtDate(d.payments[d.payments.length-1].date)}{d.payments[d.payments.length-1].amount>0 && ` · pago ${fmt(d.payments[d.payments.length-1].amount)}`}{d.payments[d.payments.length-1].interest>0 && ` · interés +${fmt(d.payments[d.payments.length-1].interest)}`}</div>
+                  )}
+                </div>
               ) : d.noEndDate ? (
                 <div className="flex flex-col gap-2 mt-1">
                   {d.mode==='auto' ? (
@@ -4033,6 +4605,14 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
   const myPockets = accounts.filter(a => a.parentAccountId === id);
   const parentAccount = account.parentAccountId ? accounts.find(a=>a.id===account.parentAccountId) : null;
 
+  // tarjetas de crédito unidas a ESTA cuenta — para mostrar cuánto interés le suman, en dinero y en %.
+  const linkedCreditCards = debts.filter(d => d.isCreditCard && d.linkedBalanceAccountId===id);
+  const totalInterestCharged = linkedCreditCards.reduce((sum, d) =>
+    sum + (d.payments||[]).filter(p=>p.kind==='interest').reduce((s,p)=>s+(p.interest||0),0), 0);
+  const distinctRates = [...new Set(linkedCreditCards.map(d=>d.interestRate||0))];
+  const sameRateEverywhere = distinctRates.length <= 1;
+  const annualRate = sameRateEverywhere ? Math.round((distinctRates[0]||0)*12*100)/100 : null;
+
   // transferencias de ahorro que tocan esta cuenta
   const transfers = savingsEntries
     .filter(e => e.fromAccountId===id || e.toAccountId===id)
@@ -4130,6 +4710,21 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
           </div>
         )}
       </div>
+
+      {linkedCreditCards.length>0 && (
+        <div className="grid grid-cols-2 gap-3">
+          <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-4 shadow-soft">
+            <div className="text-xs uppercase tracking-wider text-gray-500">Pago de intereses</div>
+            <div className="font-mono text-lg font-semibold text-red-400 mt-1">{fmt(totalInterestCharged)}</div>
+            <div className="text-xs text-gray-500 mt-0.5">Total sumado a esta cuenta por su tarjeta{linkedCreditCards.length>1 ? 's' : ''}</div>
+          </div>
+          <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-4 shadow-soft">
+            <div className="text-xs uppercase tracking-wider text-gray-500">Porcentaje anual de intereses</div>
+            <div className="font-mono text-lg font-semibold text-ink-900 dark:text-gray-100 mt-1">{sameRateEverywhere ? `${annualRate}%` : 'Varias tasas'}</div>
+            <div className="text-xs text-gray-500 mt-0.5">{sameRateEverywhere ? `${distinctRates[0]||0}% mensual × 12` : linkedCreditCards.map(d=>`${d.name}: ${(d.interestRate||0)}%`).join(' · ')}</div>
+          </div>
+        </div>
+      )}
 
       <button onClick={()=>onQuickPocketPayment(id)} className="self-start flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3.5 py-2 rounded-lg transition">
         <IWallet size={14}/> Pagar desde {account.name}
