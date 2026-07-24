@@ -4542,6 +4542,93 @@ function NewExpenseCard({ totalCommitted, incomeThisMonth, antThisMonth, liquide
   );
 }
 
+function BigPurchaseCard({ totalCommitted, incomeThisMonth, antThisMonth, liquidezTotal }) {
+  const [kind, setKind] = useState('carro');
+  const [totalValue, setTotalValue] = useState('');
+  const [downPayment, setDownPayment] = useState('');
+  const [monthlyInstallment, setMonthlyInstallment] = useState('');
+  const [monthlyInsurance, setMonthlyInsurance] = useState('');
+  const [oneTimeCosts, setOneTimeCosts] = useState('');
+  const [otherMonthly, setOtherMonthly] = useState('');
+
+  const oneTimeCostsLabel = kind==='carro' ? 'Gastos únicos (matrícula, passaggio di proprietà...)'
+    : kind==='casa' ? 'Gastos únicos (notario, registro, impuestos...)'
+    : 'Gastos únicos de entrada';
+
+  const monthlyExtra = Math.round(((Number(monthlyInstallment)||0) + (Number(monthlyInsurance)||0) + (Number(otherMonthly)||0))*100)/100;
+  const initialCost = Math.round(((Number(downPayment)||0) + (Number(oneTimeCosts)||0))*100)/100;
+  const newCommitted = Math.round((totalCommitted + monthlyExtra)*100)/100;
+  const currentFlow = incomeThisMonth - totalCommitted - antThisMonth;
+  const newFlow = incomeThisMonth - newCommitted - antThisMonth;
+  const currentMonths = totalCommitted>0 ? liquidezTotal/totalCommitted : null;
+  const newMonths = newCommitted>0 ? liquidezTotal/newCommitted : null;
+  const pctOfIncome = incomeThisMonth>0 ? Math.round((monthlyExtra/incomeThisMonth)*1000)/10 : null;
+  const hasData = totalValue!=='' || downPayment!=='' || monthlyInstallment!=='' || monthlyInsurance!=='' || oneTimeCosts!=='' || otherMonthly!=='';
+
+  return (
+    <SimCard title="Simular una compra o inversión grande" icon={<IHome size={18} className="text-emerald-400"/>}>
+      <div className="flex flex-wrap gap-2 -mt-1">
+        {[['carro','🚗 Carro'],['casa','🏠 Casa'],['inversion','📈 Inversión'],['otro','📦 Otro']].map(([k,label]) => (
+          <button key={k} type="button" onClick={()=>setKind(k)}
+            className={`px-3 py-1.5 rounded-full text-xs transition ${kind===k ? 'bg-gold-500 text-ink-900 font-medium' : 'bg-paper-200 dark:bg-ink-600 text-gray-500 dark:text-gray-400'}`}>
+            {label}
+          </button>
+        ))}
+      </div>
+      <div className="grid sm:grid-cols-2 gap-4">
+        <Field label="Valor total del bien (€)">
+          <input type="number" step="0.01" className={inputCls} value={totalValue} onChange={e=>setTotalValue(e.target.value)} placeholder="Ej. 15000"/>
+        </Field>
+        <Field label="Entrada / pago inicial (€)">
+          <input type="number" step="0.01" className={inputCls} value={downPayment} onChange={e=>setDownPayment(e.target.value)} placeholder="Ej. 3000"/>
+        </Field>
+        <Field label="Cuota mensual (€)">
+          <input type="number" step="0.01" className={inputCls} value={monthlyInstallment} onChange={e=>setMonthlyInstallment(e.target.value)} placeholder="Ej. 250"/>
+        </Field>
+        <Field label="Seguro mensual (€)">
+          <input type="number" step="0.01" className={inputCls} value={monthlyInsurance} onChange={e=>setMonthlyInsurance(e.target.value)} placeholder="Ej. 60"/>
+        </Field>
+        <Field label={oneTimeCostsLabel}>
+          <input type="number" step="0.01" className={inputCls} value={oneTimeCosts} onChange={e=>setOneTimeCosts(e.target.value)} placeholder="Ej. 400"/>
+        </Field>
+        <Field label="Otros gastos mensuales (mantenimiento, etc.)">
+          <input type="number" step="0.01" className={inputCls} value={otherMonthly} onChange={e=>setOtherMonthly(e.target.value)} placeholder="Ej. 30"/>
+        </Field>
+      </div>
+      {hasData ? (
+        <div className="grid sm:grid-cols-3 gap-4 pt-3 border-t border-paper-300/60 dark:border-ink-500/40">
+          <div>
+            <div className="text-xs text-gray-500">Costo inicial (entrada + gastos únicos)</div>
+            <div className="font-mono text-ink-900 dark:text-gray-100">{fmt(initialCost)}</div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500">Nuevo compromiso mensual</div>
+            <div className="font-mono text-red-400">+{fmt(monthlyExtra)}</div>
+          </div>
+          {pctOfIncome!==null && (
+            <div>
+              <div className="text-xs text-gray-500">% de tu ingreso mensual</div>
+              <div className="font-mono" style={{color: pctOfIncome>45?'#EF4444':'#3DDC97'}}>{pctOfIncome}%</div>
+            </div>
+          )}
+          <div>
+            <div className="text-xs text-gray-500">Comprometido al mes</div>
+            <div className="font-mono text-ink-900 dark:text-gray-100">{fmt(totalCommitted)} → {fmt(newCommitted)}</div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500">Flujo real al mes</div>
+            <div className="font-mono"><span className="text-gray-500">{fmt(currentFlow)}</span> → <span style={{color: newFlow>=0?'#3DDC97':'#EF4444'}}>{fmt(newFlow)}</span></div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500">Meses de colchón</div>
+            <div className="font-mono text-ink-900 dark:text-gray-100">{currentMonths!==null?Math.round(currentMonths*10)/10:'—'} → {newMonths!==null?Math.round(newMonths*10)/10:'—'}</div>
+          </div>
+        </div>
+      ) : <p className="text-xs text-gray-500">Pon al menos un número para ver el efecto.</p>}
+    </SimCard>
+  );
+}
+
 function SimulatorView({ debts, incomeThisMonth, totalCommitted, antThisMonth, netFlowThisMonth, liquidezTotal }) {
   return (
     <div className="flex flex-col gap-5">
@@ -4551,6 +4638,7 @@ function SimulatorView({ debts, incomeThisMonth, totalCommitted, antThisMonth, n
         : <SimCard title="Pagar extra a una deuda" icon={<ICard size={18} className="text-red-400"/>}><p className="text-xs text-gray-500">No tienes deudas con número fijo de cuotas para simular.</p></SimCard>}
       <IncomeChangeCard incomeThisMonth={incomeThisMonth} totalCommitted={totalCommitted} antThisMonth={antThisMonth}/>
       <NewExpenseCard totalCommitted={totalCommitted} incomeThisMonth={incomeThisMonth} antThisMonth={antThisMonth} liquidezTotal={liquidezTotal}/>
+      <BigPurchaseCard totalCommitted={totalCommitted} incomeThisMonth={incomeThisMonth} antThisMonth={antThisMonth} liquidezTotal={liquidezTotal}/>
     </div>
   );
 }
