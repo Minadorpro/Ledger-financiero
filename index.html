@@ -5898,6 +5898,7 @@ function SplitView({ rules, accounts, incomeAuto, salaryOverride, salaryForSplit
           : <SimCard title="Pagar extra a una deuda" icon={<ICard size={18} className="text-red-400"/>}><p className="text-xs text-gray-500">No tienes deudas con número fijo de cuotas para simular.</p></SimCard>}
         <IncomeChangeCard incomeThisMonth={incomeThisMonth} totalCommitted={totalCommitted} antThisMonth={antThisMonth}/>
         <NewExpenseCard totalCommitted={totalCommitted} incomeThisMonth={incomeThisMonth} antThisMonth={antThisMonth} liquidezTotal={liquidezTotal}/>
+        <BigPurchaseCard totalCommitted={totalCommitted} incomeThisMonth={incomeThisMonth} antThisMonth={antThisMonth} liquidezTotal={liquidezTotal}/>
       </div>
     </div>
   );
