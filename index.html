@@ -690,14 +690,20 @@ function effectiveMonthlyValueNow(f) {
 // cuánto sale de UNA cuenta concreta este mes: deudas + suscripciones + gastos fijos vinculados a
 // ella, más gastos hormiga y pagos de pocket hechos desde ella. Se usa tanto para la cuenta misma
 // como para sumar lo que sale de sus pockets (una cuenta madre "sale" también lo que salga de sus pockets).
+// cuánto ha salido de verdad de UNA cuenta concreta este mes: deudas + suscripciones + gastos fijos
+// vinculados a ella que YA se pagaron este ciclo, más gastos hormiga y pagos de pocket hechos desde
+// ella (esos ya son movimientos reales por definición). Se usa tanto para la cuenta misma como para
+// sumar lo que ha salido de sus pockets. Es un total HISTÓRICO de lo que ya pasó — no un pronóstico
+// de lo que falta por pagar (eso se muestra aparte, en los banners de "según categoría / mes").
 function accountMonthlyOut(accountId, debts, subs, fixed, antExpenses, pocketPayments) {
   const now = new Date();
+  const y = now.getFullYear(), m = now.getMonth();
   const linkedDebts = (debts||[]).filter(d=>d.accountId===accountId && !d.finished);
   const linkedSubs = (subs||[]).filter(s=>s.accountId===accountId);
   const linkedFixed = (fixed||[]).filter(f=>f.accountId===accountId);
-  const debtsPart = linkedDebts.filter(debtCountsThisMonth).reduce((s,d)=>s+(d.monthlyPayment||0),0);
-  const subsPart = linkedSubs.filter(s=>s.active && s.frequency!=='annual').reduce((s,x)=>s+effectiveSubValueNow(x),0);
-  const fixedPart = linkedFixed.filter(f=>f.paymentDay ? fixedCountsThisMonth(f) : isPaidThisCycle(f)).reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
+  const debtsPart = linkedDebts.filter(d => debtCountsThisMonth(d) && isDebtPaidForOccurrence(d, y, m)).reduce((s,d)=>s+(d.monthlyPayment||0),0);
+  const subsPart = linkedSubs.filter(s => s.active && s.frequency!=='annual' && isPaidThisCycle(s)).reduce((s,x)=>s+effectiveSubValueNow(x),0);
+  const fixedPart = linkedFixed.filter(f => (f.paymentDay ? fixedCountsThisMonth(f) : true) && (f.paymentDay ? isFixedPaidForMonth(f,y,m) : isPaidThisCycle(f))).reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
   const antsPart = (antExpenses||[]).filter(e=>e.accountId===accountId && isSameMonth(e.date, now)).reduce((s,e)=>s+e.amount,0);
   const pocketPaysPart = (pocketPayments||[]).filter(e=>e.accountId===accountId && isSameMonth(e.date, now)).reduce((s,e)=>s+e.amount,0);
   return { debtsPart, subsPart, fixedPart, antsPart, pocketPaysPart, total: debtsPart+subsPart+fixedPart+antsPart+pocketPaysPart };
@@ -4744,19 +4750,26 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
   const linkedFixed = fixed.filter(f=>f.accountId===id);
 
   const nowMO = new Date();
-  const debtsCountedItems = linkedDebts.filter(debtCountsThisMonth);
-  const subsCountedItems = linkedSubs.filter(s=>s.active && s.frequency!=='annual');
-  const fixedCountedItems = linkedFixed.filter(f=>f.paymentDay ? fixedCountsThisMonth(f) : isPaidThisCycle(f));
+  const yMO = nowMO.getFullYear(), mMO = nowMO.getMonth();
+  // "Sale cada mes" (arriba) es HISTÓRICO — solo cuenta lo que YA se pagó este ciclo, un movimiento
+  // real. Los 3 banners de abajo ("Deudas/mes", etc.) son lo CONTRARIO: lo que todavía FALTA por
+  // pagar — así entre los dos números completan la historia (lo que ya salió + lo que falta).
+  const debtsPaidItems = linkedDebts.filter(d => debtCountsThisMonth(d) && isDebtPaidForOccurrence(d, yMO, mMO));
+  const subsPaidItems = linkedSubs.filter(s => s.active && s.frequency!=='annual' && isPaidThisCycle(s));
+  const fixedPaidItems = linkedFixed.filter(f => (f.paymentDay ? fixedCountsThisMonth(f) : true) && (f.paymentDay ? isFixedPaidForMonth(f,yMO,mMO) : isPaidThisCycle(f)));
+  const debtsCountedItems = linkedDebts.filter(d => debtCountsThisMonth(d) && !isDebtPaidForOccurrence(d, yMO, mMO));
+  const subsCountedItems = linkedSubs.filter(s => s.active && s.frequency!=='annual' && !isPaidThisCycle(s));
+  const fixedCountedItems = linkedFixed.filter(f => (f.paymentDay ? fixedCountsThisMonth(f) : true) && !(f.paymentDay ? isFixedPaidForMonth(f,yMO,mMO) : isPaidThisCycle(f)));
   const antsThisMonthList = ants.filter(e=>isSameMonth(e.date, nowMO));
   const pocketPaysThisMonthList = pocketPays.filter(e=>isSameMonth(e.date, nowMO));
-  const debtsPart = debtsCountedItems.reduce((s,d)=>s+(d.monthlyPayment||0),0);
-  const subsPart = subsCountedItems.reduce((s,x)=>s+effectiveSubValueNow(x),0);
-  const fixedPart = fixedCountedItems.reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
+  const debtsPart = debtsPaidItems.reduce((s,d)=>s+(d.monthlyPayment||0),0);
+  const subsPart = subsPaidItems.reduce((s,x)=>s+effectiveSubValueNow(x),0);
+  const fixedPart = fixedPaidItems.reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
   const antsPart = antsThisMonthList.reduce((s,e)=>s+e.amount,0);
   const pocketPaysPart = pocketPaysThisMonthList.reduce((s,e)=>s+e.amount,0);
-  // lo que sale de cada uno de sus pockets (deudas/suscripciones/fijos/hormiga/pagos vinculados a ELLOS,
-  // no a esta cuenta) — porque tú mandas dinero de esta cuenta a los pockets, así que lo suyo también
-  // es, en el fondo, dinero que sale de aquí.
+  // lo que YA ha salido de cada uno de sus pockets (deudas/suscripciones/fijos/hormiga/pagos vinculados
+  // a ELLOS, no a esta cuenta) — porque tú mandas dinero de esta cuenta a los pockets, así que lo suyo
+  // también es, en el fondo, dinero que sale de aquí, cuando ya se pagó de verdad con ese pocket.
   const pocketsOutList = myPockets.map(p => ({ pocket: p, out: accountMonthlyOut(p.id, debts, subs, fixed, antExpenses, pocketPayments) }));
   const pocketsOutTotal = pocketsOutList.reduce((s,x)=>s+x.out.total, 0);
   const monthlyOut = debtsPart + subsPart + fixedPart + antsPart + pocketPaysPart + pocketsOutTotal;
@@ -4797,6 +4810,12 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
             )}
           </div>
         )}
+      </div>
+
+      <div className="grid grid-cols-3 gap-3">
+        <SectionBanner emoji="💳" label="Deudas / mes" count={debtsCountedItems.length} total={debtsPart} active={expandedSection==='deudasMes'} onClick={()=>setExpandedSection(s=>s==='deudasMes'?null:'deudasMes')}/>
+        <SectionBanner emoji="🔁" label="Suscripciones / mes" count={subsCountedItems.length} total={subsPart} active={expandedSection==='subsMes'} onClick={()=>setExpandedSection(s=>s==='subsMes'?null:'subsMes')}/>
+        <SectionBanner emoji="🏠" label="Gastos fijos / mes" count={fixedCountedItems.length} total={fixedPart} active={expandedSection==='fijosMes'} onClick={()=>setExpandedSection(s=>s==='fijosMes'?null:'fijosMes')}/>
       </div>
 
       {linkedCreditCards.length>0 && (
@@ -4995,6 +5014,24 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
                 amount={effectiveMonthlyValueNow(f)} positive={false}
                 onEdit={()=>onEditFixed(f)} onDelete={()=>onDeleteFixed(f)}/>
             ))}
+            {expandedSection==='deudasMes' && (debtsCountedItems.length>0 ? debtsCountedItems.map(d => (
+              <Row key={d.id} emoji={d.emoji} title={d.name}
+                subtitle={`Día ${d.paymentDay} de cada mes · ${d.mode==='auto'?'Automático':'Manual'}`}
+                amount={d.monthlyPayment} positive={false}
+                onEdit={()=>onEditDebt(d)} onDelete={()=>onDeleteDebt(d)}/>
+            )) : <p className="text-sm text-gray-500 py-2">Ya no queda ninguna deuda pendiente de pagar este mes.</p>)}
+            {expandedSection==='subsMes' && (subsCountedItems.length>0 ? subsCountedItems.map(s => (
+              <Row key={s.id} emoji={s.emoji} title={s.name}
+                subtitle={`Mensual, día ${s.billingDay}`}
+                amount={effectiveSubValueNow(s)} positive={false}
+                onEdit={()=>onEditSub(s)} onDelete={()=>onDeleteSub(s)}/>
+            )) : <p className="text-sm text-gray-500 py-2">Ya no queda ninguna suscripción pendiente de pagar este mes.</p>)}
+            {expandedSection==='fijosMes' && (fixedCountedItems.length>0 ? fixedCountedItems.map(f => (
+              <Row key={f.id} emoji={f.emoji} title={f.name}
+                subtitle={f.paymentDay ? `Día ${f.paymentDay} de cada mes` : 'Sin día fijo'}
+                amount={effectiveMonthlyValueNow(f)} positive={false}
+                onEdit={()=>onEditFixed(f)} onDelete={()=>onDeleteFixed(f)}/>
+            )) : <p className="text-sm text-gray-500 py-2">Ya no queda ningún gasto fijo pendiente de pagar este mes.</p>)}
           </div>
         )}
         </>
