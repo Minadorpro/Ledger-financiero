@@ -510,6 +510,16 @@ function creditCardBalance(debt, accounts) {
 }
 
 // pago mínimo de una tarjeta de crédito: % del importe total debido, con un piso en €
+// cuánto se pagó DE VERDAD este mes por una deuda — para tarjetas de crédito, monthlyPayment es
+// solo el mínimo PROYECTADO para el próximo ciclo (cambia con el saldo), no lo que realmente se
+// pagó la última vez, así que hay que mirar el historial real de pagos (d.payments). Para deudas
+// normales (cuota fija), monthlyPayment sí es lo que se paga cada vez, así que ese vale directo.
+function actualDebtPaymentThisMonth(debt) {
+  if (!debt.isCreditCard) return debt.monthlyPayment || 0;
+  const now = new Date();
+  return (debt.payments||[]).filter(p => p.kind==='payment' && isSameMonth(p.date, now)).reduce((s,p)=>s+(p.amount||0), 0);
+}
+
 function creditCardMinPayment(debt) {
   const pct = (debt.minPaymentPercent || 3) / 100;
   const floor = debt.minPaymentFloor || 30;
@@ -557,6 +567,15 @@ function debtOccursThisMonth(debt) {
 }
 
 function isSameMonth(dateISO, ref) { const d = new Date(dateISO); return d.getFullYear()===ref.getFullYear() && d.getMonth()===ref.getMonth(); }
+// los bancos no procesan cobros en fin de semana — si un cobro automático cae sábado o domingo,
+// se corre al lunes siguiente (los bancos están cerrados esos días y no pueden descontar).
+function nextBusinessDay(date) {
+  const d = new Date(date);
+  const day = d.getDay(); // 0=domingo, 6=sábado
+  if (day === 6) d.setDate(d.getDate() + 2);
+  else if (day === 0) d.setDate(d.getDate() + 1);
+  return d;
+}
 function isSameYear(dateISO, ref) { return new Date(dateISO).getFullYear()===ref.getFullYear(); }
 
 // inicio del ciclo mensual actual (la última vez que cayó el día de pago, hoy incluido)
@@ -644,12 +663,12 @@ function effectiveDay(item, y, m, defaultDay) {
 function isDebtPaidForOccurrence(debt, y, m) {
   const occ = new Date(y, m, clampDay(effectiveDay(debt,y,m,debt.paymentDay), y, m)); occ.setHours(0,0,0,0);
   const today0 = new Date(); today0.setHours(0,0,0,0);
-  if (debt.mode === 'auto') return occ <= today0; // "automático" solo se da por pagado una vez que la fecha ya llegó
+  if (debt.mode === 'auto') return nextBusinessDay(occ) <= today0; // "automático": corre a lunes si cae en fin de semana
   if (debt.noEndDate) {
     if (!debt.lastPaid) return false;
-    const prevOcc = addMonths(occ, -1);
-    const lastPaid = new Date(debt.lastPaid);
-    return lastPaid > prevOcc && lastPaid <= addMonths(occ, 1);
+    // ¿el último pago cayó en ESTE mismo mes calendario? (antes esto usaba un rango de casi 2 meses
+    // que hacía que un pago de fin de julio contara también como "pagado" para agosto)
+    return isSameMonth(debt.lastPaid, new Date(y, m, 1));
   }
   const idx = installmentIndexAt(debt, y, m);
   return idx > 0 && idx <= effectivePaid(debt);
@@ -658,7 +677,7 @@ function isDebtPaidForOccurrence(debt, y, m) {
 function isRecurringPaidForOccurrence(item, y, m, day) {
   const occ = new Date(y, m, day); occ.setHours(0,0,0,0);
   const today0 = new Date(); today0.setHours(0,0,0,0);
-  if (item.mode === 'auto') return occ <= today0;
+  if (item.mode === 'auto') return nextBusinessDay(occ) <= today0; // corre a lunes si cae en fin de semana
   if (!item.lastPaid) return false;
   const prevOcc = addMonths(occ, -1);
   const lastPaid = new Date(item.lastPaid);
@@ -701,7 +720,7 @@ function accountMonthlyOut(accountId, debts, subs, fixed, antExpenses, pocketPay
   const linkedDebts = (debts||[]).filter(d=>d.accountId===accountId && !d.finished);
   const linkedSubs = (subs||[]).filter(s=>s.accountId===accountId);
   const linkedFixed = (fixed||[]).filter(f=>f.accountId===accountId);
-  const debtsPart = linkedDebts.filter(d => debtCountsThisMonth(d) && isDebtPaidForOccurrence(d, y, m)).reduce((s,d)=>s+(d.monthlyPayment||0),0);
+  const debtsPart = linkedDebts.filter(d => debtCountsThisMonth(d) && isDebtPaidForOccurrence(d, y, m)).reduce((s,d)=>s+actualDebtPaymentThisMonth(d),0);
   const subsPart = linkedSubs.filter(s => s.active && s.frequency!=='annual' && isPaidThisCycle(s)).reduce((s,x)=>s+effectiveSubValueNow(x),0);
   const fixedPart = linkedFixed.filter(f => (f.paymentDay ? fixedCountsThisMonth(f) : true) && (f.paymentDay ? isFixedPaidForMonth(f,y,m) : isPaidThisCycle(f))).reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
   const antsPart = (antExpenses||[]).filter(e=>e.accountId===accountId && isSameMonth(e.date, now)).reduce((s,e)=>s+e.amount,0);
@@ -2247,7 +2266,8 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       const newPayments = [];
       let futureCycles = null;
 
-      if (d.mode==='auto' && !cyc.paymentDone && today >= (d.paymentDay||3)) {
+      const paymentTargetDate = nextBusinessDay(new Date(now.getFullYear(), now.getMonth(), d.paymentDay||3));
+      if (d.mode==='auto' && !cyc.paymentDone && now >= paymentTargetDate) {
         const amount = d.autoPaymentMode==='total' ? totalValue
           : d.autoPaymentMode==='custom' ? Math.min(d.autoCustomAmount||0, totalValue)
           : Math.round(creditCardMinPayment({ ...d, totalValue })*100)/100;
@@ -2272,7 +2292,8 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         }
       }
 
-      if (cyc.pending && !cyc.interestDone && today >= (d.interestDay||15)) {
+      const interestTargetDate = nextBusinessDay(new Date(now.getFullYear(), now.getMonth(), d.interestDay||15));
+      if (cyc.pending && !cyc.interestDone && now >= interestTargetDate) {
         let interest = 0;
         if (totalValue > 0.01) {
           interest = Math.round(totalValue * ((d.interestRate||0)/100) * 100) / 100;
@@ -2841,6 +2862,21 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const fixedNoDayCount = useMemo(()=> fixedExpenses.filter(f=>!f.paymentDay && !isPaidThisCycle(f)).length, [fixedExpenses]);
   const fixedNoDayTotal = useMemo(()=> fixedExpenses.filter(f=>!f.paymentDay && !isPaidThisCycle(f)).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0), [fixedExpenses]);
   const totalCommitted = totalDebtMonthly + subsMonthlyReal + totalFixedMonthly;
+  // versión "solo lo ya pagado" de lo mismo — SOLO para el Dashboard ("Flujo real de este mes"), sin
+  // tocar totalCommitted (que se sigue usando tal cual en el resto de la app: reparto de ingresos,
+  // la alerta del 45%, etc., donde interesa el compromiso total del mes, no solo lo ya cubierto).
+  const totalDebtMonthlyPaid = useMemo(() => {
+    const now = new Date(); const y = now.getFullYear(), m = now.getMonth();
+    return activeDebts.filter(d => debtCountsThisMonth(d) && isDebtPaidForOccurrence(d, y, m)).reduce((a,d)=>a+actualDebtPaymentThisMonth(d),0);
+  }, [activeDebts]);
+  const subsMonthlyRealPaid = useMemo(() => activeSubs.filter(s=>s.frequency!=='annual' && isPaidThisCycle(s)).reduce((a,s)=>a+effectiveSubValueNow(s),0), [activeSubs]);
+  const totalFixedMonthlyPaid = useMemo(() => {
+    const now = new Date(); const y = now.getFullYear(), m = now.getMonth();
+    const withDay = fixedExpenses.filter(f=>f.paymentDay && fixedCountsThisMonth(f) && isFixedPaidForMonth(f,y,m)).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0);
+    const noDayPaid = fixedExpenses.filter(f=>!f.paymentDay && isPaidThisCycle(f)).reduce((a,f)=>a+effectiveMonthlyValueNow(f),0);
+    return withDay + noDayPaid;
+  }, [fixedExpenses]);
+  const totalCommittedPaidThisMonth = totalDebtMonthlyPaid + subsMonthlyRealPaid + totalFixedMonthlyPaid;
   // de lo comprometido este mes, cuánto todavía no se ha pagado/descontado
   // (los gastos fijos sin día no entran aquí: si cuentan en el total, es justo porque YA se pagaron)
   const debtsPendingThisMonth = useMemo(() => {
@@ -3086,9 +3122,11 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     return rows.filter(r=>r.daysUntil<=14).sort((a,b)=>a.daysUntil-b.daysUntil);
   }, [activeDebts, activeSubs, fixedExpenses]);
 
-  // alerta de saldo insuficiente: cruza lo que le toca pagar esta semana a cada cuenta contra su saldo disponible
+  // alerta de saldo insuficiente: cruza lo que le toca pagar esta semana a cada cuenta contra su
+  // saldo disponible — excluyendo lo que ya se pagó este ciclo (si no, seguía avisando de algo que
+  // ya se descontó, solo porque su próxima fecha de cobro seguía cayendo dentro de los 7 días).
   const balanceAlerts = useMemo(() => {
-    const soon = upcoming.filter(u => u.daysUntil <= 7 && u.accountId);
+    const soon = upcoming.filter(u => u.daysUntil <= 7 && u.accountId && !u.paidThisCycle);
     const byAccount = {};
     soon.forEach(u => { byAccount[u.accountId] = (byAccount[u.accountId] || 0) + u.amount; });
     return Object.entries(byAccount).map(([accId, needed]) => {
@@ -3305,6 +3343,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                   hasIncomeData={incomeEntries.length>0}
                   netWorth={netWorth} hasAccounts={accounts.length>0}
                   paymentStreak={paymentStreak} committedTrend={committedTrend} balanceAlerts={balanceAlerts} committedPctThisMonth={committedPctThisMonth}
+                  totalCommittedPaidThisMonth={totalCommittedPaidThisMonth}
                 />
               )}
               {view==='accounts' && (
@@ -3527,7 +3566,7 @@ function AddButton({ view, onAdd }) {
 /* =========================================================================
    DASHBOARD
    ========================================================================= */
-function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDebtPending, totalSubMonthly, totalFixedMonthly, totalSaved, savedThisMonth, monthsToFreedom, freedomDate, distribution, upcoming, reminders, activeDebtsCount, incomeThisMonth, antThisMonth, netFlowThisMonth, hasIncomeData, netWorth, hasAccounts, paymentStreak, committedTrend, balanceAlerts, committedPctThisMonth }) {
+function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDebtPending, totalSubMonthly, totalFixedMonthly, totalSaved, savedThisMonth, monthsToFreedom, freedomDate, distribution, upcoming, reminders, activeDebtsCount, incomeThisMonth, antThisMonth, netFlowThisMonth, hasIncomeData, netWorth, hasAccounts, paymentStreak, committedTrend, balanceAlerts, committedPctThisMonth, totalCommittedPaidThisMonth }) {
   return (
     <div className="flex flex-col gap-6">
       {reminders.length>0 && (
@@ -3577,11 +3616,14 @@ function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDe
               <div className="text-gray-500 text-xs mt-1">Entradas</div>
             </div>
             <div>
-              <div className="font-mono text-lg text-red-400">-{fmt(totalCommitted + antThisMonth + savedThisMonth)}</div>
-              <div className="text-gray-500 text-xs mt-1">Comprometido + hormiga + ahorro</div>
+              <div className="font-mono text-lg text-red-400">-{fmt(totalCommittedPaidThisMonth + antThisMonth + savedThisMonth)}</div>
+              <div className="text-gray-500 text-xs mt-1">Pagado + hormiga + ahorro</div>
             </div>
             <div>
-              <div className={`font-mono text-lg font-semibold ${(netFlowThisMonth-savedThisMonth)>=0 ? 'text-gold-500' : 'text-red-400'}`}>{fmt(netFlowThisMonth-savedThisMonth)}</div>
+              {(() => {
+                const teQueda = incomeThisMonth - totalCommittedPaidThisMonth - antThisMonth - savedThisMonth;
+                return <div className={`font-mono text-lg font-semibold ${teQueda>=0 ? 'text-gold-500' : 'text-red-400'}`}>{fmt(teQueda)}</div>;
+              })()}
               <div className="text-gray-500 text-xs mt-1">Te queda</div>
             </div>
           </div>
@@ -4552,24 +4594,41 @@ function BigPurchaseCard({ totalCommitted, incomeThisMonth, antThisMonth, liquid
   const [kind, setKind] = useState('carro');
   const [totalValue, setTotalValue] = useState('');
   const [downPayment, setDownPayment] = useState('');
-  const [monthlyInstallment, setMonthlyInstallment] = useState('');
-  const [monthlyInsurance, setMonthlyInsurance] = useState('');
   const [oneTimeCosts, setOneTimeCosts] = useState('');
+  const [tan, setTan] = useState(''); // TAN / interés anual de la financiación (%)
+  const [loanMonths, setLoanMonths] = useState(''); // plazo en meses
+  const [manualInstallment, setManualInstallment] = useState(''); // si no quieres usar TAN+plazo, pones la cuota a mano
+  const [insuranceAmount, setInsuranceAmount] = useState('');
+  const [insuranceFreq, setInsuranceFreq] = useState('monthly'); // 'monthly' | 'annual' — en varios países (ej. Italia) el seguro del carro se paga de una vez al año, no por mes
   const [otherMonthly, setOtherMonthly] = useState('');
 
-  const oneTimeCostsLabel = kind==='carro' ? 'Gastos únicos (matrícula, passaggio di proprietà...)'
-    : kind==='casa' ? 'Gastos únicos (notario, registro, impuestos...)'
-    : 'Gastos únicos de entrada';
+  const oneTimeCostsLabel = kind==='carro' ? 'Otros gastos únicos (matrícula, passaggio di proprietà...)'
+    : kind==='casa' ? 'Otros gastos únicos (notario, registro, impuestos...)'
+    : 'Otros gastos únicos de entrada';
 
-  const monthlyExtra = Math.round(((Number(monthlyInstallment)||0) + (Number(monthlyInsurance)||0) + (Number(otherMonthly)||0))*100)/100;
-  const initialCost = Math.round(((Number(downPayment)||0) + (Number(oneTimeCosts)||0))*100)/100;
+  // financiación: si pones TAN + plazo, la cuota y los intereses se calculan solos (amortización
+  // francesa, la que usan los bancos); si no, puedes poner la cuota a mano y solo hacemos el reparto simple.
+  const financedAmount = Math.max(0, (Number(totalValue)||0) - (Number(downPayment)||0));
+  const months = Number(loanMonths)||0;
+  const monthlyRate = (Number(tan)||0)/100/12;
+  const useAutoInstallment = months>0 && (Number(tan)||0)>0;
+  const calculatedInstallment = useAutoInstallment
+    ? financedAmount * (monthlyRate * Math.pow(1+monthlyRate, months)) / (Math.pow(1+monthlyRate, months) - 1)
+    : (months>0 ? financedAmount/months : (Number(manualInstallment)||0));
+  const monthlyInstallment = Math.round(calculatedInstallment*100)/100;
+  const totalToPay = months>0 ? Math.round((monthlyInstallment*months)*100)/100 : null;
+  const totalInterest = totalToPay!==null ? Math.round((totalToPay-financedAmount)*100)/100 : null;
+
+  const insuranceMonthlyEquiv = insuranceFreq==='annual' ? (Number(insuranceAmount)||0)/12 : (Number(insuranceAmount)||0);
+  const monthlyExtra = Math.round((monthlyInstallment + insuranceMonthlyEquiv + (Number(otherMonthly)||0))*100)/100;
+  const initialCost = Math.round(((Number(downPayment)||0) + (Number(oneTimeCosts)||0) + (insuranceFreq==='annual' ? (Number(insuranceAmount)||0) : 0))*100)/100;
   const newCommitted = Math.round((totalCommitted + monthlyExtra)*100)/100;
   const currentFlow = incomeThisMonth - totalCommitted - antThisMonth;
   const newFlow = incomeThisMonth - newCommitted - antThisMonth;
   const currentMonths = totalCommitted>0 ? liquidezTotal/totalCommitted : null;
   const newMonths = newCommitted>0 ? liquidezTotal/newCommitted : null;
   const pctOfIncome = incomeThisMonth>0 ? Math.round((monthlyExtra/incomeThisMonth)*1000)/10 : null;
-  const hasData = totalValue!=='' || downPayment!=='' || monthlyInstallment!=='' || monthlyInsurance!=='' || oneTimeCosts!=='' || otherMonthly!=='';
+  const hasData = totalValue!=='' || downPayment!=='' || manualInstallment!=='' || loanMonths!=='' || insuranceAmount!=='' || oneTimeCosts!=='' || otherMonthly!=='';
 
   return (
     <SimCard title="Simular una compra o inversión grande" icon={<IHome size={18} className="text-emerald-400"/>}>
@@ -4581,55 +4640,112 @@ function BigPurchaseCard({ totalCommitted, incomeThisMonth, antThisMonth, liquid
           </button>
         ))}
       </div>
-      <div className="grid sm:grid-cols-2 gap-4">
-        <Field label="Valor total del bien (€)">
-          <input type="number" step="0.01" className={inputCls} value={totalValue} onChange={e=>setTotalValue(e.target.value)} placeholder="Ej. 15000"/>
-        </Field>
-        <Field label="Entrada / pago inicial (€)">
-          <input type="number" step="0.01" className={inputCls} value={downPayment} onChange={e=>setDownPayment(e.target.value)} placeholder="Ej. 3000"/>
-        </Field>
-        <Field label="Cuota mensual (€)">
-          <input type="number" step="0.01" className={inputCls} value={monthlyInstallment} onChange={e=>setMonthlyInstallment(e.target.value)} placeholder="Ej. 250"/>
-        </Field>
-        <Field label="Seguro mensual (€)">
-          <input type="number" step="0.01" className={inputCls} value={monthlyInsurance} onChange={e=>setMonthlyInsurance(e.target.value)} placeholder="Ej. 60"/>
-        </Field>
-        <Field label={oneTimeCostsLabel}>
-          <input type="number" step="0.01" className={inputCls} value={oneTimeCosts} onChange={e=>setOneTimeCosts(e.target.value)} placeholder="Ej. 400"/>
-        </Field>
-        <Field label="Otros gastos mensuales (mantenimiento, etc.)">
-          <input type="number" step="0.01" className={inputCls} value={otherMonthly} onChange={e=>setOtherMonthly(e.target.value)} placeholder="Ej. 30"/>
-        </Field>
+
+      {/* PAGOS ÚNICOS */}
+      <div className="flex flex-col gap-3 bg-paper-200/60 dark:bg-ink-600/40 rounded-xl p-3">
+        <span className="text-xs font-semibold uppercase tracking-wider text-ink-900 dark:text-gray-100">1. Pagos únicos</span>
+        <div className="grid sm:grid-cols-2 gap-4">
+          <Field label="Valor total del bien (€)">
+            <input type="number" step="0.01" className={inputCls} value={totalValue} onChange={e=>setTotalValue(e.target.value)} placeholder="Ej. 8000"/>
+          </Field>
+          <Field label="Entrada / pago inicial (€)">
+            <input type="number" step="0.01" className={inputCls} value={downPayment} onChange={e=>setDownPayment(e.target.value)} placeholder="Ej. 4000"/>
+          </Field>
+          <Field label={oneTimeCostsLabel}>
+            <input type="number" step="0.01" className={inputCls} value={oneTimeCosts} onChange={e=>setOneTimeCosts(e.target.value)} placeholder="Ej. 580"/>
+          </Field>
+        </div>
       </div>
+
+      {/* PAGOS RECURRENTES */}
+      <div className="flex flex-col gap-3 bg-paper-200/60 dark:bg-ink-600/40 rounded-xl p-3">
+        <span className="text-xs font-semibold uppercase tracking-wider text-ink-900 dark:text-gray-100">2. Pagos recurrentes</span>
+        {financedAmount>0 && (
+          <div className="text-xs text-gray-500 -mb-1">Monto a financiar (valor − entrada): <span className="font-mono text-ink-900 dark:text-gray-100">{fmt(financedAmount)}</span></div>
+        )}
+        <div className="grid sm:grid-cols-2 gap-4">
+          <Field label="TAN / interés anual de la financiación (%)">
+            <input type="number" step="0.01" className={inputCls} value={tan} onChange={e=>setTan(e.target.value)} placeholder="Ej. 7.5"/>
+          </Field>
+          <Field label="Plazo de financiación (meses)">
+            <input type="number" className={inputCls} value={loanMonths} onChange={e=>setLoanMonths(e.target.value)} placeholder="Ej. 36"/>
+          </Field>
+          <Field label="Cuota mensual (€)">
+            {useAutoInstallment ? (
+              <input type="text" disabled className={inputCls+" opacity-70 cursor-not-allowed"} value={fmt(monthlyInstallment)}/>
+            ) : (
+              <input type="number" step="0.01" className={inputCls} value={manualInstallment} onChange={e=>setManualInstallment(e.target.value)} placeholder="Ej. 200"/>
+            )}
+            <p className="text-[11px] text-gray-500 mt-1">{useAutoInstallment ? 'Calculada sola con el TAN y el plazo.' : loanMonths ? 'Sin TAN puesto: se reparte el monto a financiar entre los meses, sin interés.' : 'Pon el plazo (y opcionalmente el TAN) para que se calcule sola, o escríbela tú aquí.'}</p>
+          </Field>
+          <Field label="Seguro (€)">
+            <div className="flex gap-2">
+              <input type="number" step="0.01" className={inputCls} value={insuranceAmount} onChange={e=>setInsuranceAmount(e.target.value)} placeholder="Ej. 850"/>
+              <div className="flex rounded-lg overflow-hidden border border-paper-300 dark:border-ink-500 shrink-0">
+                <button type="button" onClick={()=>setInsuranceFreq('monthly')} className={`px-2.5 text-xs transition ${insuranceFreq==='monthly' ? 'bg-gold-500 text-ink-900 font-medium' : 'bg-white dark:bg-ink-700 text-gray-500'}`}>Mes</button>
+                <button type="button" onClick={()=>setInsuranceFreq('annual')} className={`px-2.5 text-xs transition ${insuranceFreq==='annual' ? 'bg-gold-500 text-ink-900 font-medium' : 'bg-white dark:bg-ink-700 text-gray-500'}`}>Año</button>
+              </div>
+            </div>
+            {insuranceFreq==='annual' && (Number(insuranceAmount)||0)>0 && (
+              <p className="text-[11px] text-gray-500 mt-1">≈ {fmt(insuranceMonthlyEquiv)}/mes — se paga una vez al año, pero cuenta así para tu compromiso mensual.</p>
+            )}
+          </Field>
+          <Field label="Otros gastos mensuales (mantenimiento, etc.)">
+            <input type="number" step="0.01" className={inputCls} value={otherMonthly} onChange={e=>setOtherMonthly(e.target.value)} placeholder="Ej. 30"/>
+          </Field>
+        </div>
+      </div>
+
       {hasData ? (
-        <div className="grid sm:grid-cols-3 gap-4 pt-3 border-t border-paper-300/60 dark:border-ink-500/40">
-          <div>
-            <div className="text-xs text-gray-500">Costo inicial (entrada + gastos únicos)</div>
-            <div className="font-mono text-ink-900 dark:text-gray-100">{fmt(initialCost)}</div>
-          </div>
-          <div>
-            <div className="text-xs text-gray-500">Nuevo compromiso mensual</div>
-            <div className="font-mono text-red-400">+{fmt(monthlyExtra)}</div>
-          </div>
-          {pctOfIncome!==null && (
-            <div>
-              <div className="text-xs text-gray-500">% de tu ingreso mensual</div>
-              <div className="font-mono" style={{color: pctOfIncome>45?'#EF4444':'#3DDC97'}}>{pctOfIncome}%</div>
+        <>
+          {totalToPay!==null && (
+            <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-3 flex flex-col gap-1">
+              <span className="text-xs font-semibold uppercase tracking-wider text-red-400">Deuda total de la financiación (con intereses)</span>
+              <div className="grid sm:grid-cols-3 gap-3 mt-1">
+                <div>
+                  <div className="text-xs text-gray-500">Monto financiado</div>
+                  <div className="font-mono text-ink-900 dark:text-gray-100">{fmt(financedAmount)}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-gray-500">Total a pagar en {months} cuotas</div>
+                  <div className="font-mono text-ink-900 dark:text-gray-100">{fmt(totalToPay)}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-gray-500">Intereses totales</div>
+                  <div className="font-mono text-red-400">+{fmt(totalInterest)}</div>
+                </div>
+              </div>
             </div>
           )}
-          <div>
-            <div className="text-xs text-gray-500">Comprometido al mes</div>
-            <div className="font-mono text-ink-900 dark:text-gray-100">{fmt(totalCommitted)} → {fmt(newCommitted)}</div>
+          <div className="grid sm:grid-cols-3 gap-4 pt-3 border-t border-paper-300/60 dark:border-ink-500/40">
+            <div>
+              <div className="text-xs text-gray-500">Costo inicial (entrada + gastos únicos)</div>
+              <div className="font-mono text-ink-900 dark:text-gray-100">{fmt(initialCost)}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-500">Nuevo compromiso mensual</div>
+              <div className="font-mono text-red-400">+{fmt(monthlyExtra)}</div>
+            </div>
+            {pctOfIncome!==null && (
+              <div>
+                <div className="text-xs text-gray-500">% de tu ingreso mensual</div>
+                <div className="font-mono" style={{color: pctOfIncome>45?'#EF4444':'#3DDC97'}}>{pctOfIncome}%</div>
+              </div>
+            )}
+            <div>
+              <div className="text-xs text-gray-500">Comprometido al mes</div>
+              <div className="font-mono text-ink-900 dark:text-gray-100">{fmt(totalCommitted)} → {fmt(newCommitted)}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-500">Flujo real al mes</div>
+              <div className="font-mono"><span className="text-gray-500">{fmt(currentFlow)}</span> → <span style={{color: newFlow>=0?'#3DDC97':'#EF4444'}}>{fmt(newFlow)}</span></div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-500">Meses de colchón</div>
+              <div className="font-mono text-ink-900 dark:text-gray-100">{currentMonths!==null?Math.round(currentMonths*10)/10:'—'} → {newMonths!==null?Math.round(newMonths*10)/10:'—'}</div>
+            </div>
           </div>
-          <div>
-            <div className="text-xs text-gray-500">Flujo real al mes</div>
-            <div className="font-mono"><span className="text-gray-500">{fmt(currentFlow)}</span> → <span style={{color: newFlow>=0?'#3DDC97':'#EF4444'}}>{fmt(newFlow)}</span></div>
-          </div>
-          <div>
-            <div className="text-xs text-gray-500">Meses de colchón</div>
-            <div className="font-mono text-ink-900 dark:text-gray-100">{currentMonths!==null?Math.round(currentMonths*10)/10:'—'} → {newMonths!==null?Math.round(newMonths*10)/10:'—'}</div>
-          </div>
-        </div>
+        </>
       ) : <p className="text-xs text-gray-500">Pon al menos un número para ver el efecto.</p>}
     </SimCard>
   );
@@ -4707,16 +4823,18 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
   const sameRateEverywhere = distinctRates.length <= 1;
   const annualRate = sameRateEverywhere ? Math.round((distinctRates[0]||0)*12*100)/100 : null;
 
-  // transferencias de ahorro que tocan esta cuenta
+  // transferencias de ahorro que tocan esta cuenta — solo las de ESTE mes (se reinicia cada mes,
+  // a diferencia de lo "vinculado" que se queda igual siempre)
   const transfers = savingsEntries
-    .filter(e => e.fromAccountId===id || e.toAccountId===id)
+    .filter(e => (e.fromAccountId===id || e.toAccountId===id) && isSameMonth(e.date, new Date()))
     .sort((a,b)=> new Date(b.date) - new Date(a.date));
 
   // pagos que realmente se descontaron de esta cuenta O de sus pockets, con su fecha real —
-  // mandas dinero de aquí a los pockets, así que lo suyo también es, en el fondo, un pago de esta cuenta.
+  // mandas dinero de aquí a los pockets, así que lo suyo también es, en el fondo, un pago de esta
+  // cuenta. Solo ESTE mes — se reinicia cada mes, a diferencia de lo "vinculado".
   const myPocketIds = myPockets.map(p=>p.id);
   const charged = (duePayments||[])
-    .filter(p => p.accountId === id || myPocketIds.includes(p.accountId))
+    .filter(p => (p.accountId === id || myPocketIds.includes(p.accountId)) && isSameMonth(p.date, new Date()))
     .sort((a,b) => b.date - a.date);
   const typeLabel = { debt:'Deuda', sub:'Suscripción', fixed:'Gasto fijo' };
   // importe que de verdad se movió por cada cargo (puede ser 0 si el corte de "ayer" lo dejó en 0€)
@@ -4729,16 +4847,17 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
     return map;
   }, [appliedPayments]);
 
+  // solo ESTE mes — se reinicia cada mes, a diferencia de lo "vinculado"
   const ants = (antExpenses||[])
-    .filter(e => e.accountId===id)
+    .filter(e => e.accountId===id && isSameMonth(e.date, new Date()))
     .sort((a,b)=> new Date(b.date) - new Date(a.date));
 
   const pocketPays = (pocketPayments||[])
-    .filter(e => e.accountId===id)
+    .filter(e => e.accountId===id && isSameMonth(e.date, new Date()))
     .sort((a,b)=> new Date(b.date) - new Date(a.date));
 
   const accTransfers = (transferList||[])
-    .filter(t => t.fromAccountId===id || t.toAccountId===id)
+    .filter(t => (t.fromAccountId===id || t.toAccountId===id) && isSameMonth(t.date, new Date()))
     .sort((a,b)=> new Date(b.date) - new Date(a.date));
 
   const incomes = (incomeEntries||[])
@@ -4762,9 +4881,14 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
   const fixedCountedItems = linkedFixed.filter(f => (f.paymentDay ? fixedCountsThisMonth(f) : true) && !(f.paymentDay ? isFixedPaidForMonth(f,yMO,mMO) : isPaidThisCycle(f)));
   const antsThisMonthList = ants.filter(e=>isSameMonth(e.date, nowMO));
   const pocketPaysThisMonthList = pocketPays.filter(e=>isSameMonth(e.date, nowMO));
-  const debtsPart = debtsPaidItems.reduce((s,d)=>s+(d.monthlyPayment||0),0);
+  const debtsPart = debtsPaidItems.reduce((s,d)=>s+actualDebtPaymentThisMonth(d),0);
   const subsPart = subsPaidItems.reduce((s,x)=>s+effectiveSubValueNow(x),0);
   const fixedPart = fixedPaidItems.reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
+  // totales PENDIENTES (lo que todavía falta) — para los banners "Deudas/Suscripciones/Gastos fijos
+  // por mes". Son DISTINTOS de debtsPart/subsPart/fixedPart (que son lo ya pagado, para "Sale cada mes").
+  const debtsPendingTotal = debtsCountedItems.reduce((s,d)=>s+(d.monthlyPayment||0),0);
+  const subsPendingTotal = subsCountedItems.reduce((s,x)=>s+effectiveSubValueNow(x),0);
+  const fixedPendingTotal = fixedCountedItems.reduce((s,f)=>s+effectiveMonthlyValueNow(f),0);
   const antsPart = antsThisMonthList.reduce((s,e)=>s+e.amount,0);
   const pocketPaysPart = pocketPaysThisMonthList.reduce((s,e)=>s+e.amount,0);
   // lo que YA ha salido de cada uno de sus pockets (deudas/suscripciones/fijos/hormiga/pagos vinculados
@@ -4813,9 +4937,9 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
       </div>
 
       <div className="grid grid-cols-3 gap-3">
-        <SectionBanner emoji="💳" label="Deudas / mes" count={debtsCountedItems.length} total={debtsPart} active={expandedSection==='deudasMes'} onClick={()=>setExpandedSection(s=>s==='deudasMes'?null:'deudasMes')}/>
-        <SectionBanner emoji="🔁" label="Suscripciones / mes" count={subsCountedItems.length} total={subsPart} active={expandedSection==='subsMes'} onClick={()=>setExpandedSection(s=>s==='subsMes'?null:'subsMes')}/>
-        <SectionBanner emoji="🏠" label="Gastos fijos / mes" count={fixedCountedItems.length} total={fixedPart} active={expandedSection==='fijosMes'} onClick={()=>setExpandedSection(s=>s==='fijosMes'?null:'fijosMes')}/>
+        <SectionBanner emoji="💳" label="Deudas / mes" count={debtsCountedItems.length} total={debtsPendingTotal} active={expandedSection==='deudasMes'} onClick={()=>setExpandedSection(s=>s==='deudasMes'?null:'deudasMes')}/>
+        <SectionBanner emoji="🔁" label="Suscripciones / mes" count={subsCountedItems.length} total={subsPendingTotal} active={expandedSection==='subsMes'} onClick={()=>setExpandedSection(s=>s==='subsMes'?null:'subsMes')}/>
+        <SectionBanner emoji="🏠" label="Gastos fijos / mes" count={fixedCountedItems.length} total={fixedPendingTotal} active={expandedSection==='fijosMes'} onClick={()=>setExpandedSection(s=>s==='fijosMes'?null:'fijosMes')}/>
       </div>
 
       {linkedCreditCards.length>0 && (
@@ -4924,15 +5048,15 @@ function AccountDetail({ account, accounts, savingsEntries, incomeEntries, antEx
         return (
         <>
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-          {charged.length>0 && <SectionBanner emoji="🧾" label="Pagos realizados" count={charged.length} total={pagosTotal} active={expandedSection==='pagos'} onClick={()=>toggle('pagos')}/>}
+          {charged.length>0 && <SectionBanner emoji="🧾" label="Pagos realizados / mes" count={charged.length} total={pagosTotal} active={expandedSection==='pagos'} onClick={()=>toggle('pagos')}/>}
           {ants.length>0 && <SectionBanner emoji="🐜" label="Gastos hormiga" count={ants.length} total={hormigaTotal} active={expandedSection==='hormiga'} onClick={()=>toggle('hormiga')}/>}
-          {transfers.length>0 && <SectionBanner emoji="🐷" label="Aporte en ahorro" count={transfers.length} total={ahorroTotal} active={expandedSection==='ahorro'} onClick={()=>toggle('ahorro')}/>}
+          {transfers.length>0 && <SectionBanner emoji="🐷" label="Aporte en ahorro / mes" count={transfers.length} total={ahorroTotal} active={expandedSection==='ahorro'} onClick={()=>toggle('ahorro')}/>}
           {linkedDebts.length>0 && <SectionBanner emoji="💳" label="Deudas vinculadas" count={linkedDebts.length} total={deudasTotal} active={expandedSection==='deudas'} onClick={()=>toggle('deudas')}/>}
           {linkedSubs.length>0 && <SectionBanner emoji="🔁" label="Suscripciones vinculadas" count={linkedSubs.length} total={subsTotal} active={expandedSection==='subs'} onClick={()=>toggle('subs')}/>}
           {linkedFixed.length>0 && <SectionBanner emoji="🏠" label="Gastos fijos vinculados" count={linkedFixed.length} total={fixedTotal} active={expandedSection==='fijos'} onClick={()=>toggle('fijos')}/>}
           {incomes.length>0 && <SectionBanner emoji="💶" label="Entradas" count={incomes.length} total={entradasTotal} active={expandedSection==='entradas'} onClick={()=>toggle('entradas')}/>}
-          {pocketPays.length>0 && <SectionBanner emoji="💵" label="Pagos" count={pocketPays.length} total={pocketPaysTotal} active={expandedSection==='pocketpagos'} onClick={()=>toggle('pocketpagos')}/>}
-          {accTransfers.length>0 && <SectionBanner emoji="🔄" label="Transferencias entre cuentas" count={accTransfers.length} total={transfersTotal} active={expandedSection==='transfers'} onClick={()=>toggle('transfers')}/>}
+          {pocketPays.length>0 && <SectionBanner emoji="💵" label="Pagos / mes" count={pocketPays.length} total={pocketPaysTotal} active={expandedSection==='pocketpagos'} onClick={()=>toggle('pocketpagos')}/>}
+          {accTransfers.length>0 && <SectionBanner emoji="🔄" label="Transferencias entre cuentas / mes" count={accTransfers.length} total={transfersTotal} active={expandedSection==='transfers'} onClick={()=>toggle('transfers')}/>}
         </div>
 
         {expandedSection && (
@@ -5578,12 +5702,35 @@ function AntExpensesView({ entries, thisMonth, thisYear, budget, onSetBudget, on
   const [editingBudget, setEditingBudget] = useState(false);
   const [draft, setDraft] = useState(budget || '');
   const sorted = [...entries].sort((a,b)=> new Date(b.date) - new Date(a.date));
+
+  const nowAE = new Date();
+  const [catYear, setCatYear] = useState(nowAE.getFullYear());
+  const [catMonth, setCatMonth] = useState(nowAE.getMonth()); // 0-indexado
+
+  const catYears = useMemo(() => {
+    const set = new Set(entries.map(e=>new Date(e.date).getFullYear()));
+    set.add(nowAE.getFullYear());
+    return [...set].sort((a,b)=>b-a);
+    // eslint-disable-next-line
+  }, [entries]);
+
+  // categorías del mes/año elegido (por defecto, el mes actual)
   const byCategory = useMemo(() => {
     const map = {};
-    entries.forEach(e => { map[e.category] = (map[e.category]||0) + e.amount; });
+    entries.forEach(e => {
+      const d = new Date(e.date);
+      if (d.getFullYear()===catYear && d.getMonth()===catMonth) map[e.category] = (map[e.category]||0) + e.amount;
+    });
     return Object.entries(map).sort((a,b)=>b[1]-a[1]);
-  }, [entries]);
+  }, [entries, catYear, catMonth]);
   const maxCat = byCategory.length ? byCategory[0][1] : 1;
+
+  // gastado por cada uno de los 12 meses del año elegido
+  const byMonthChart = useMemo(() => {
+    const totals = Array(12).fill(0);
+    entries.forEach(e => { const d = new Date(e.date); if (d.getFullYear()===catYear) totals[d.getMonth()] += e.amount; });
+    return totals.map((total,i) => ({ mes: MESES[i].slice(0,3), total: Math.round(total*100)/100 }));
+  }, [entries, catYear]);
 
   const pct = budget > 0 ? Math.min(Math.round((thisMonth/budget)*100), 100) : 0;
   const over = budget > 0 && thisMonth > budget;
@@ -5638,9 +5785,25 @@ function AntExpensesView({ entries, thisMonth, thisYear, budget, onSetBudget, on
         )}
       </div>
 
-      {byCategory.length>0 && (
-        <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft">
+      <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-1">
           <span className="uppercase tracking-wider text-gray-500 dark:text-gray-400 font-medium">Por categoría</span>
+          <div className="flex flex-wrap items-center gap-2">
+            <select value={catMonth} onChange={e=>setCatMonth(Number(e.target.value))}
+              className="text-xs rounded-full px-2.5 py-1 bg-paper-200 dark:bg-ink-600 text-ink-900 dark:text-gray-200 border-0 focus:ring-2 focus:ring-gold-500">
+              {MESES.map((m,i) => <option key={i} value={i}>{m}</option>)}
+            </select>
+            <div className="flex gap-1.5">
+              {catYears.map(y => (
+                <button key={y} onClick={()=>setCatYear(y)}
+                  className={`px-2.5 py-1 rounded-full text-xs font-mono transition ${y===catYear ? 'bg-gold-500 text-ink-900 font-medium' : 'text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600'}`}>
+                  {y}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        {byCategory.length>0 ? (
           <div className="flex flex-col gap-3 mt-3">
             {byCategory.map(([cat, val]) => (
               <div key={cat} className="flex flex-col gap-1.5">
@@ -5651,8 +5814,34 @@ function AntExpensesView({ entries, thisMonth, thisYear, budget, onSetBudget, on
               </div>
             ))}
           </div>
+        ) : <p className="text-sm text-gray-500 mt-3">Sin gastos hormiga en {MESES[catMonth].toLowerCase()} de {catYear}.</p>}
+      </div>
+
+      <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+          <span className="uppercase tracking-wider text-gray-500 dark:text-gray-400 font-medium">Gastado por mes ({catYear})</span>
+          <div className="flex gap-1.5">
+            {catYears.map(y => (
+              <button key={y} onClick={()=>setCatYear(y)}
+                className={`px-2.5 py-1 rounded-full text-xs font-mono transition ${y===catYear ? 'bg-gold-500 text-ink-900 font-medium' : 'text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600'}`}>
+                {y}
+              </button>
+            ))}
+          </div>
         </div>
-      )}
+        <div className="h-56">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={byMonthChart} margin={{top:8, right:8, left:0, bottom:0}}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#8A8F9822" vertical={false}/>
+              <XAxis dataKey="mes" tick={{fontSize:11, fill:'#8A8F98'}} axisLine={false} tickLine={false}/>
+              <YAxis tick={{fontSize:11, fill:'#8A8F98'}} axisLine={false} tickLine={false} tickFormatter={(v)=>`${v}€`}/>
+              <Tooltip formatter={(v)=>fmt(v)} cursor={{fill:'#8A8F9811'}}
+                contentStyle={{background:'#1A1D23', border:'1px solid #2A2E37', borderRadius:12, fontSize:12, color:'#E6E8EB'}}/>
+              <Bar dataKey="total" radius={[6,6,0,0]} fill={COLORS.debt} maxBarSize={36}/>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
 
       {sorted.length===0 ? (
         <EmptyState text="Registra esos gastos pequeños e irregulares (café, antojos, transporte suelto...) para ver cuánto se te va realmente." onAdd={onAdd} cta="Nuevo gasto"/>
@@ -5955,6 +6144,10 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
     const today0 = new Date(); today0.setHours(0,0,0,0);
     const occDate = new Date(y, m, day);
     const isPast = occDate < today0;
+    // para automático, "atrasado" debe respetar el mismo corrimiento a lunes que ya usa el motor de
+    // cobro — si no, el calendario marcaba "atrasado" un cobro que en realidad se movió al lunes y
+    // todavía no le tocaba.
+    const isPastAuto = nextBusinessDay(occDate) < today0;
     debts.forEach(d => {
       const first = new Date(d.firstPaymentDate);
       const monthIndex = y*12+m, firstIndex = first.getFullYear()*12+first.getMonth();
@@ -5963,7 +6156,7 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
       const withinSchedule = d.noEndDate || !d.totalInstallments || (monthIndex - firstIndex) < d.totalInstallments;
       if (monthIndex >= firstIndex && withinSchedule && clampDay(effectiveDay(d,y,m,d.paymentDay),y,m)===day) {
         const paid = isDebtPaidForOccurrence(d, y, m);
-        list.push({type:'debt', id:d.id, name:d.name, emoji:d.emoji, amount:d.monthlyPayment, paid, overdue: isPast && !paid});
+        list.push({type:'debt', id:d.id, name:d.name, emoji:d.emoji, amount:d.monthlyPayment, paid, overdue: (d.mode==='auto' ? isPastAuto : isPast) && !paid});
       }
     });
     subs.forEach(s => {
@@ -5974,17 +6167,17 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
         // de su primer cobro real. Ahora exige también que el año no sea anterior al de billingDate.
         if (y >= anchor.getFullYear() && anchor.getMonth()===m && clampDay(effectiveDay(s,y,m,anchor.getDate()),y,m)===day) {
           const paid = isRecurringPaidForOccurrence(s, y, m, day);
-          list.push({type:'sub', id:s.id, name:s.name, emoji:s.emoji, amount:effectiveSubValue(s,y,m), paid, overdue: isPast && !paid});
+          list.push({type:'sub', id:s.id, name:s.name, emoji:s.emoji, amount:effectiveSubValue(s,y,m), paid, overdue: (s.mode==='auto' ? isPastAuto : isPast) && !paid});
         }
       } else if (startedByMonth(s.startDate, y, m) && clampDay(effectiveDay(s,y,m,s.billingDay),y,m)===day) {
         const paid = isRecurringPaidForOccurrence(s, y, m, day);
-        list.push({type:'sub', id:s.id, name:s.name, emoji:s.emoji, amount:effectiveSubValue(s,y,m), paid, overdue: isPast && !paid});
+        list.push({type:'sub', id:s.id, name:s.name, emoji:s.emoji, amount:effectiveSubValue(s,y,m), paid, overdue: (s.mode==='auto' ? isPastAuto : isPast) && !paid});
       }
     });
     fixed.forEach(f => {
       if (f.paymentDay && startedByMonth(f.startDate, y, m) && clampDay(effectiveDay(f,y,m,f.paymentDay),y,m)===day) {
         const paid = isFixedPaidForMonth(f, y, m);
-        list.push({type:'fixed', id:f.id, name:f.name, emoji:f.emoji, amount:effectiveMonthlyValue(f,y,m), paid, overdue: isPast && !paid});
+        list.push({type:'fixed', id:f.id, name:f.name, emoji:f.emoji, amount:effectiveMonthlyValue(f,y,m), paid, overdue: (f.mode==='auto' ? isPastAuto : isPast) && !paid});
       } else if (!f.paymentDay && f.lastPaid) {
         // sin día fijo no hay una fecha programada de la que colgarse, así que lo mostramos
         // en el día real en que lo marcaste pagado (nunca como "atrasado", porque no tiene fecha límite)
