@@ -2560,7 +2560,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const finalAmount = s.manualMonthlyValue ? (Number(amount) || 0) : (s.annualPrice||0);
     setSubscriptions(l => l.map(x => x.id===id
       ? {...x, lastPaid: todayISO(), paidMonths: addPaidMonth(x.paidMonths),
-         monthlyValues: s.manualMonthlyValue ? {...(x.monthlyValues||{}), [key]: finalAmount} : x.monthlyValues}
+         ...(s.manualMonthlyValue ? { monthlyValues: {...(x.monthlyValues||{}), [key]: finalAmount} } : {})}
       : x));
     if (isNewAnnualCycle && s.accountId) {
       applyBalanceDeltas([{ accountId: s.accountId, delta: -finalAmount }]);
@@ -2594,7 +2594,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const finalAmount = f.manualMonthlyValue ? (Number(amount) || 0) : (f.monthlyValue||0);
     setFixedExpenses(l => l.map(x => x.id===id
       ? {...x, lastPaid: todayISO(), paidMonths: addPaidMonth(x.paidMonths),
-         monthlyValues: f.manualMonthlyValue ? {...(x.monthlyValues||{}), [key]: finalAmount} : x.monthlyValues}
+         ...(f.manualMonthlyValue ? { monthlyValues: {...(x.monthlyValues||{}), [key]: finalAmount} } : {})}
       : x));
     if (!alreadyPaid && f.accountId && !f.paymentDay) {
       applyBalanceDeltas([{ accountId: f.accountId, delta: -finalAmount }]);
