@@ -360,6 +360,15 @@ function fmt(n) {
 }
 function fmtNum(n) { return (Number(n)||0).toLocaleString('es-ES', {maximumFractionDigits:2}); }
 
+// convierte cualquier dato a texto de forma ESTABLE (ordenando las llaves en cada nivel, no solo
+// arriba) — para poder comparar "¿esto es de verdad distinto?" sin que el orden en que Firestore
+// devuelve los campos (que no garantiza ningún orden) haga parecer distinto algo que es idéntico.
+function stableStringify(obj) {
+  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return '[' + obj.map(stableStringify).join(',') + ']';
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';
+}
 function todayISO() { return new Date().toISOString().slice(0,10); }
 function currentMonthKey() { const n = new Date(); return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,'0')}`; }
 // a qué ciclo (mes) pertenece el PRÓXIMO día de interés, contando desde hoy — si el día de interés
@@ -486,7 +495,11 @@ function elapsedInstallments(debt) {
   if (today < cursor) return 0;
   let count = 0;
   const total = debt.totalInstallments || 0;
-  while (cursor <= today && count < total) {
+  // ojo: tiene que usar el MISMO ajuste de fin de semana que usa el motor que de verdad mueve el
+  // dinero (isDebtPaidForOccurrence) — si no, una cuota podía contarse como "ya pasada" el sábado,
+  // la deuda se marcaba "finalizada" antes de tiempo, y como las deudas finalizadas quedan
+  // excluidas del cobro automático, esa última cuota nunca llegaba a descontarse ni el lunes.
+  while (nextBusinessDay(cursor) <= today && count < total) {
     count++;
     cursor = addMonths(cursor, 1);
   }
@@ -2102,6 +2115,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const [pocketPayments, setPocketPayments] = useState([]); // pagos rápidos desde un pocket/cuenta — solo afectan el saldo, no cuentan como gasto hormiga
   const [appliedPayments, setAppliedPayments] = useState(null); // claves de pagos ya descontados de las cuentas
   const [saveError, setSaveError] = useState(null); // mensaje visible si falla el guardado en Firestore
+  const [saveStatus, setSaveStatus] = useState('idle'); // 'idle' | 'saving' | 'saved' — para poder ver EN VIVO qué está pasando con el guardado
   const [monthlyHistory, setMonthlyHistory] = useState([]);
   const [view, setView] = useState('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -2134,6 +2148,41 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       if (hasPendingWrites) return; // es nuestro propio guardado aún sin confirmar — el estado local ya lo tiene
       if (pendingSavesRef.current > 0) return; // tenemos un guardado nuestro todavía en camino — no lo pisamos con esto
       const d = data || seedData();
+      // CANDADO CLAVE: si lo que llega es, en contenido, exactamente lo mismo que ya tenemos (el eco
+      // de nuestro propio guardado, ya confirmado por el servidor), NO lo volvemos a aplicar. Si lo
+      // hiciéramos, Firestore siempre deserializa en arrays/objetos NUEVOS aunque el contenido sea
+      // idéntico — y aplicar esos "nuevos" con setDebts/setAccounts/etc. dispara el efecto de guardado
+      // otra vez (que compara por referencia, no por contenido), lo que guarda de nuevo, lo que
+      // notifica de nuevo... un ciclo de guardados infinito, sin ninguna acción del usuario de por medio.
+      // OJO: no usamos la variable "loaded" de React aquí — este callback se crea UNA sola vez
+      // (atado a [store], no a [store, loaded]), así que "loaded" quedaría congelado en el valor
+      // que tenía en ese momento (false) para siempre, y esta comprobación nunca se llegaría a
+      // ejecutar de verdad. latestSnapshotRef sí sirve porque es una referencia (ref), no estado
+      // de React, así que su .current siempre está actualizado sin importar cuándo se creó la función.
+      if (latestSnapshotRef.current) {
+        const current = latestSnapshotRef.current;
+        const comparable = {
+          debts: current.debts, subscriptions: current.subscriptions, fixedExpenses: current.fixedExpenses,
+          savingsProjects: current.savingsProjects, savingsEntries: current.savingsEntries, incomeEntries: current.incomeEntries,
+          antExpenses: current.antExpenses, antBudget: current.antBudget, savingsBudget: current.savingsBudget,
+          incomeSplitRules: current.incomeSplitRules, financialGoals: current.financialGoals, extraIncome: current.extraIncome,
+          salaryOverrides: current.salaryOverrides, exchangeRate: current.exchangeRate, expectedIncome: current.expectedIncome,
+          simulatedIncome: current.simulatedIncome, accounts: current.accounts, accountsInit: current.accountsInit,
+          transfers: current.transfers, pocketPayments: current.pocketPayments, appliedPayments: current.appliedPayments,
+          monthlyHistory: current.monthlyHistory, theme: current.theme,
+        };
+        const incoming = {
+          debts: d.debts||[], subscriptions: d.subscriptions||[], fixedExpenses: d.fixedExpenses||[],
+          savingsProjects: d.savingsProjects||[], savingsEntries: d.savingsEntries||[], incomeEntries: d.incomeEntries||[],
+          antExpenses: d.antExpenses||[], antBudget: d.antBudget||0, savingsBudget: d.savingsBudget||0,
+          incomeSplitRules: d.incomeSplitRules||[], financialGoals: d.financialGoals||[], extraIncome: d.extraIncome||[],
+          salaryOverrides: d.salaryOverrides||{}, exchangeRate: d.exchangeRate||0.92, expectedIncome: d.expectedIncome||0,
+          simulatedIncome: d.simulatedIncome||{}, accounts: d.accounts||current.accounts, accountsInit: true,
+          transfers: d.transfers||[], pocketPayments: d.pocketPayments||[], appliedPayments: d.appliedPayments||null,
+          monthlyHistory: d.monthlyHistory||[], theme: d.theme||'dark',
+        };
+        if (stableStringify(incoming) === stableStringify(comparable)) return;
+      }
       setDebts(d.debts || []);
       setSubscriptions(d.subscriptions || []);
       setFixedExpenses(d.fixedExpenses || []);
@@ -2179,11 +2228,12 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const saveChainRef = useRef(Promise.resolve());
   const enqueueSave = (payload) => {
     pendingSavesRef.current++;
+    setSaveStatus('saving');
     saveChainRef.current = saveChainRef.current
       .catch(() => {}) // si el guardado anterior falló, no dejamos que eso bloquee los siguientes
       .then(() => store.save(payload))
-      .then(() => setSaveError(null))
-      .catch(e => { console.error('No se pudo guardar en Firestore', e); setSaveError(e && e.message ? e.message : String(e)); })
+      .then(() => { setSaveError(null); setSaveStatus('saved'); setTimeout(() => setSaveStatus(s => s==='saved' ? 'idle' : s), 2000); })
+      .catch(e => { console.error('No se pudo guardar en Firestore', e); setSaveError(e && e.message ? e.message : String(e)); setSaveStatus('idle'); })
       .finally(() => { pendingSavesRef.current = Math.max(0, pendingSavesRef.current - 1); });
     return saveChainRef.current;
   };
@@ -2916,18 +2966,25 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       // se descontaría DOS VECES por el mismo pago, y "Cancelar" desde la cuenta solo revertiría
       // una de las dos, dejando todo descuadrado. Por eso quedan fuera de aquí.
       if (d.isCreditCard) return;
-      if (!d.accountId || d.finished) return;
+      if (!d.accountId) return;
       const first = new Date(d.firstPaymentDate);
       const firstIdx = first.getFullYear()*12 + first.getMonth();
-      for (let idx = firstIdx; idx <= curIdx; idx++) {
+      // OJO: antes, una deuda "finalizada" se excluía del todo aquí — pero eso hacía desaparecer
+      // TAMBIÉN sus cuotas pasadas ya pagadas de verdad, y el motor de abajo (que compara contra lo
+      // ya aplicado) las interpretaba como "se deshicieron", devolviendo a la cuenta un dinero que
+      // sí había salido. Ahora, si terminó y tiene un número fijo de cuotas, seguimos incluyendo sus
+      // meses reales (hasta su última cuota) — solo dejamos de generar meses NUEVOS más allá de eso.
+      const endIdx = (d.finished && !d.noEndDate && d.totalInstallments) ? Math.min(curIdx, firstIdx + d.totalInstallments - 1) : curIdx;
+      for (let idx = firstIdx; idx <= endIdx; idx++) {
         const y = Math.floor(idx/12), m = idx%12;
         if (isDebtPaidForOccurrence(d, y, m)) {
           // "recién marcado hoy": para deudas con cuotas mira lastInstallmentMarkedAt, para las de
           // saldo (sin fecha límite) mira lastPaid — es la señal de que ESTA acción se hizo ahora
           // mismo, así que debe mover dinero ya, aunque la fecha de cobro del calendario ya haya pasado.
           const justMarked = idx===curIdx && ((d.noEndDate ? d.lastPaid : d.lastInstallmentMarkedAt) === today);
+          const rawDate = new Date(y, m, clampDay(effectiveDay(d,y,m,d.paymentDay),y,m));
           out.push({ key:`debt:${d.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:d.accountId, amount:d.monthlyPayment,
-                     type:'debt', name:d.name, emoji:d.emoji, date:new Date(y, m, clampDay(effectiveDay(d,y,m,d.paymentDay),y,m)), justMarked });
+                     type:'debt', name:d.name, emoji:d.emoji, date: d.mode==='auto' ? nextBusinessDay(rawDate) : rawDate, justMarked });
         }
       }
     });
@@ -2941,8 +2998,9 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         const day = clampDay(effectiveDay(s,y,m,s.billingDay), y, m);
         if (isRecurringPaidForOccurrence(s, y, m, day)) {
           const justMarked = idx===curIdx && s.lastPaid === today;
+          const rawDate = new Date(y, m, day);
           out.push({ key:`sub:${s.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:s.accountId, amount:effectiveSubValue(s,y,m),
-                     type:'sub', name:s.name, emoji:s.emoji, date:new Date(y, m, day), justMarked });
+                     type:'sub', name:s.name, emoji:s.emoji, date: s.mode==='auto' ? nextBusinessDay(rawDate) : rawDate, justMarked });
         }
       }
     });
@@ -2955,8 +3013,9 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         const y = Math.floor(idx/12), m = idx%12;
         if (isFixedPaidForMonth(f, y, m)) {
           const justMarked = idx===curIdx && f.lastPaid === today;
+          const rawDate = new Date(y, m, clampDay(effectiveDay(f,y,m,f.paymentDay),y,m));
           out.push({ key:`fixed:${f.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:f.accountId, amount:effectiveMonthlyValue(f,y,m),
-                     type:'fixed', name:f.name, emoji:f.emoji, date:new Date(y, m, clampDay(effectiveDay(f,y,m,f.paymentDay),y,m)), justMarked });
+                     type:'fixed', name:f.name, emoji:f.emoji, date: f.mode==='auto' ? nextBusinessDay(rawDate) : rawDate, justMarked });
         }
       }
     });
@@ -2990,13 +3049,24 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     // pagos nuevos → se descuentan de la cuenta, pero solo si su fecha es de ayer en adelante (o si
     // se acaban de marcar pagados ahora mismo); los meses anteriores a eso quedan registrados como
     // ya aplicados sin tocar el saldo (amount 0). También reprocesamos una clave que YA estaba
-    // registrada en 0€ si se acaba de volver a marcar pagada ahora — si no, una vez que un mes queda
-    // "fotografiado" en 0 (por ejemplo, la primera vez que se vinculó la cuenta) se quedaría
-    // congelado ahí para siempre, aunque después la marques pagada de verdad.
+    // registrada en 0€ si se acaba de volver a marcar pagada ahora, O si su fecha (ya con el ajuste
+    // de fin de semana) cayó dentro de la ventana "de ayer en adelante" — en automático nunca se
+    // marca nada "a mano", así que sin esto último un pago automático que quedó congelado en 0€ por
+    // cualquier motivo se quedaba así para siempre, sin ninguna forma de corregirse solo.
+    //
+    // OJO: la re-evaluación de un congelado en 0€ solo cuenta como "nuevo" de verdad si el monto que
+    // le tocaría ahora es DISTINTO de 0 — si no, cada vez que este efecto corre (que es en cada
+    // render) lo vuelve a "detectar" como nuevo, lo vuelve a escribir con el MISMO resultado (0), y
+    // como eso es una referencia nueva en el estado, dispara otro render... para siempre. Este
+    // candado corta ese ciclo: si recalcularlo sigue dando 0, no hay nada que cambiar de verdad.
     const nuevos = duePayments
       .filter(p => {
         const existing = appliedByKey.get(p.key);
-        return !existing || (existing.amount === 0 && p.justMarked);
+        if (!existing) return true;
+        if (existing.amount !== 0) return false;
+        if (!(p.justMarked || p.date >= cutoff)) return false;
+        const wouldBeAmount = (p.date < cutoff && !p.justMarked) ? 0 : p.amount;
+        return wouldBeAmount !== 0;
       })
       .map(p => ({ ...p, appliedAmount: (p.date < cutoff && !p.justMarked) ? 0 : p.amount }));
     const nuevosKeys = new Set(nuevos.map(p=>p.key));
@@ -3005,14 +3075,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
 
     if (nuevos.length === 0 && revertidos.length === 0) return;
 
-    setAccounts(list => list.map(a => {
-      const salidas  = nuevos.filter(p=>p.accountId===a.id).reduce((s,p)=>s+(p.appliedAmount||0),0);
-      const entradas = revertidos.filter(p=>p.accountId===a.id).reduce((s,p)=>s+(p.amount||0),0);
-      const delta = entradas - salidas; // en EUR (deudas/suscripciones/gastos fijos siempre están en EUR)
-      return delta ? {...a, balance: Math.round(((a.balance||0) + eurToAccountCurrency(delta, a, exchangeRate))*100)/100} : a;
-    }));
-
-    setAppliedPayments([
+    const newApplied = [
       // las entradas con importe 0 (meses pasados que ya decidimos que NUNCA mueven saldo) se
       // conservan SIEMPRE, incluso si el ítem se desvincula de la cuenta y se vuelve a vincular
       // más tarde. Si no se hiciera así, cada ciclo de "desvincular → vincular" las borra del
@@ -3022,7 +3085,23 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       // (excepto las que estamos reemplazando justo ahora en "nuevos")
       ...applied.filter(p => !nuevosKeys.has(p.key) && (p.amount === 0 || dueKeys.has(p.key))),
       ...nuevos.map(p => ({ key:p.key, accountId:p.accountId, amount:p.appliedAmount })),
-    ]);
+    ];
+
+    // candado final: si el resultado, comparado contenido a contenido, es igual al que ya había,
+    // no llamamos a setState — esto evita que el efecto se dispare a sí mismo sin fin si "nuevos"
+    // o "revertidos" siguen "detectando" algo que en la práctica no cambia nada (siempre es más
+    // seguro comparar el resultado final que confiar en que la detección de arriba sea perfecta).
+    const canon = (arr) => arr.map(p=>`${p.key}:${p.accountId||''}:${Math.round((p.amount||0)*100)}`).sort().join('|');
+    if (canon(newApplied) === canon(applied)) return;
+
+    setAccounts(list => list.map(a => {
+      const salidas  = nuevos.filter(p=>p.accountId===a.id).reduce((s,p)=>s+(p.appliedAmount||0),0);
+      const entradas = revertidos.filter(p=>p.accountId===a.id).reduce((s,p)=>s+(p.amount||0),0);
+      const delta = entradas - salidas; // en EUR (deudas/suscripciones/gastos fijos siempre están en EUR)
+      return delta ? {...a, balance: Math.round(((a.balance||0) + eurToAccountCurrency(delta, a, exchangeRate))*100)/100} : a;
+    }));
+
+    setAppliedPayments(newApplied);
   }, [loaded, duePayments, appliedPayments]);
 
   const netWorth = useMemo(()=> accounts.filter(a=>a.active && a.includeInNet).reduce((a,x)=>a+accountBalanceInEur(x, exchangeRate),0), [accounts, exchangeRate]);
@@ -3270,6 +3349,15 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
                 </>
               ) : (
                 <div className="w-2 h-2 rounded-full bg-gold-500" title={fmt(totalCommitted)}/>
+              )}
+              {saveStatus!=='idle' && (
+                sidebarOpen ? (
+                  <div className={`flex items-center gap-1.5 text-xs ${saveStatus==='saving' ? 'text-gray-500' : 'text-emerald-400'}`}>
+                    {saveStatus==='saving' ? <><span className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-pulse"/> Guardando…</> : <><ICheck size={12}/> Guardado</>}
+                  </div>
+                ) : (
+                  <div className={`w-2 h-2 rounded-full ${saveStatus==='saving' ? 'bg-gray-400 animate-pulse' : 'bg-emerald-400'}`} title={saveStatus==='saving' ? 'Guardando…' : 'Guardado'}/>
+                )
               )}
               {onLogout && sidebarOpen && (
                 <button onClick={onLogout} className="text-xs text-gray-500 hover:text-red-400 transition text-left mt-1">Cerrar sesión</button>
