@@ -1790,16 +1790,18 @@ function AccountForm({ initial, accounts, defaultParentId, onSave, onClose }) {
 }
 
 function TransferForm({ initial, accounts, onSave, onClose }) {
-  const [f, setF] = useState(initial || { amount:'', date: todayISO(), fromAccountId:'', toAccountId:'', note:'' });
+  const [f, setF] = useState(initial || { amount:'', feeAmount:'', date: todayISO(), fromAccountId:'', toAccountId:'', note:'' });
   const set = (k,v) => setF(s=>({...s,[k]:v}));
   const isEdit = !!(initial && initial.id);
   const same = f.fromAccountId && f.toAccountId && f.fromAccountId === f.toAccountId;
   const incomplete = !f.fromAccountId || !f.toAccountId;
   const from = (accounts||[]).find(a=>a.id===f.fromAccountId);
+  const feeTooBig = Number(f.feeAmount||0) >= Number(f.amount||0) && Number(f.amount||0)>0;
+  const netAmount = Math.max(0, Math.round(((Number(f.amount)||0) - (Number(f.feeAmount)||0))*100)/100);
   const submit = (e) => {
     e.preventDefault();
-    if (!f.amount || same || incomplete) return;
-    onSave({ ...f, amount:Number(f.amount) });
+    if (!f.amount || same || incomplete || feeTooBig) return;
+    onSave({ ...f, amount:Number(f.amount), feeAmount:Number(f.feeAmount)||0 });
   };
   return (
     <form onSubmit={submit} className="flex flex-col gap-4">
@@ -1832,12 +1834,21 @@ function TransferForm({ initial, accounts, onSave, onClose }) {
         </p>
       )}
       {isEdit && <p className="text-xs text-gray-500 -mt-2">Al editar, los saldos se ajustan solos a los nuevos valores.</p>}
+      <Field label="Monto de comisión (€, opcional)">
+        <input type="number" step="0.01" className={inputCls} value={f.feeAmount} onChange={e=>set('feeAmount', e.target.value)} placeholder="Ej. 0.50"/>
+        <p className="text-xs text-gray-500 mt-1.5">
+          {Number(f.feeAmount||0)>0 && f.amount
+            ? `${from ? from.name : 'La cuenta de origen'} se descuenta ${fmt(Number(f.amount))} completos, pero al destino solo llegan ${fmt(netAmount)} — la comisión desaparece, no va a ninguna cuenta.`
+            : 'Si la transferencia cobra una comisión, ponla aquí — ese monto se descuenta del origen pero nunca llega al destino.'}
+        </p>
+        {feeTooBig && <p className="text-xs text-red-400 mt-1">La comisión no puede ser igual o mayor que el monto transferido.</p>}
+      </Field>
       <Field label="Nota (opcional)">
         <input className={inputCls} value={f.note} onChange={e=>set('note', e.target.value)} placeholder="Ej. Paso dinero para la letra del coche"/>
       </Field>
       <div className="flex justify-end gap-2 mt-2">
         <button type="button" onClick={onClose} className="px-4 py-2 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Cancelar</button>
-        <button type="submit" disabled={same || incomplete} className="px-4 py-2 rounded-lg bg-gold-500 hover:bg-gold-600 text-ink-900 font-medium transition disabled:opacity-50">Guardar transferencia</button>
+        <button type="submit" disabled={same || incomplete || feeTooBig} className="px-4 py-2 rounded-lg bg-gold-500 hover:bg-gold-600 text-ink-900 font-medium transition disabled:opacity-50">Guardar transferencia</button>
       </div>
     </form>
   );
@@ -2454,13 +2465,14 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const upsertTransfer = (item) => {
     const prev = item.id ? transfers.find(x=>x.id===item.id) : null;
     setTransfers(list => item.id ? list.map(t=>t.id===item.id? {...t,...item} : t) : [...list, {...item, id:uid()}]);
+    const netOf = (t) => Math.max(0, Math.round(((t.amount||0) - (t.feeAmount||0))*100)/100);
     applyBalanceDeltas([
       ...(prev ? [
         { accountId: prev.fromAccountId, delta: prev.amount },
-        { accountId: prev.toAccountId,   delta: -prev.amount },
+        { accountId: prev.toAccountId,   delta: -netOf(prev) },
       ] : []),
       { accountId: item.fromAccountId, delta: -item.amount },
-      { accountId: item.toAccountId,   delta: item.amount },
+      { accountId: item.toAccountId,   delta: netOf(item) },
     ]);
     setModal(null);
   };
@@ -2562,9 +2574,10 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     if (type==='transfer') {
       const t = transfers.find(x=>x.id===id);
       if (t) {
+        const net = Math.max(0, Math.round(((t.amount||0) - (t.feeAmount||0))*100)/100);
         applyBalanceDeltas([
           { accountId: t.fromAccountId, delta: t.amount },
-          { accountId: t.toAccountId, delta: -t.amount },
+          { accountId: t.toAccountId, delta: -net },
         ]);
       }
       setTransfers(l=>l.filter(x=>x.id!==id));
@@ -5771,6 +5784,9 @@ function TransfersView({ items, accounts, onAdd, onEdit, onDelete }) {
                     {nameOf(t.fromAccountId)} <span className="text-gold-500">→</span> {nameOf(t.toAccountId)}
                   </div>
                   <div className="text-gray-500 dark:text-gray-500 text-xs">{fmtDate(t.date)}{t.note ? ` · ${t.note}` : ''}</div>
+                  {t.feeAmount>0 && (
+                    <div className="text-orange-500 text-xs mt-0.5">Comisión: {fmt(t.feeAmount)} · llegaron {fmt(Math.max(0,t.amount-t.feeAmount))}</div>
+                  )}
                 </div>
                 <div className="font-mono text-ink-900 dark:text-gray-100 shrink-0">{fmt(t.amount)}</div>
                 <div className="flex gap-1 shrink-0">
