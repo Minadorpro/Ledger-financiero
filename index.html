@@ -1400,13 +1400,20 @@ function CreditCardPaymentForm({ debt, onSave, onClose }) {
 // pagar el interés adelantado: deja editar el % justo antes de confirmar, igual que en el pago
 // normal — porque la tasa puede no ser fija.
 function PayInterestNowForm({ debt, onSave, onSaveRate, onClose }) {
+  const [mode, setMode] = useState('pct'); // 'pct' | 'eur' — a veces con solo el % no se llega al valor exacto que hace falta
   const [rateDraft, setRateDraft] = useState(debt.interestRate!=null ? String(debt.interestRate) : '');
+  const [amountDraft, setAmountDraft] = useState('');
+  const balance = debt.totalValue||0;
   const rate = Number(rateDraft) || 0;
-  const rateChanged = rate !== (debt.interestRate||0);
-  const interest = (debt.totalValue||0)>0.01 ? Math.round((debt.totalValue||0) * (rate/100) * 100)/100 : 0;
+  const rateChanged = mode==='pct' && rate !== (debt.interestRate||0);
+  const interestFromPct = balance>0.01 ? Math.round(balance * (rate/100) * 100)/100 : 0;
+  const interest = mode==='eur' ? (Number(amountDraft)||0) : interestFromPct;
+  // si se puso en €, calculamos qué % implica eso, para dejarlo guardado y que el próximo ciclo
+  // (automático o el que sea) parta de una tasa consistente con lo que acabas de confirmar aquí.
+  const impliedRate = mode==='eur' ? (balance>0.01 ? Math.round((interest/balance)*100*1000)/1000 : (debt.interestRate||0)) : rate;
   const submit = (e) => {
     e.preventDefault();
-    onSave(rate);
+    onSave(impliedRate, mode==='eur' ? interest : null);
   };
   return (
     <form onSubmit={submit} className="flex flex-col gap-4">
@@ -1414,9 +1421,23 @@ function PayInterestNowForm({ debt, onSave, onSaveRate, onClose }) {
         <span className="text-gray-500">Saldo actual</span>
         <span className="font-mono font-medium text-ink-900 dark:text-gray-100">{fmt(debt.totalValue||0)}</span>
       </div>
-      <Field label="% de interés mensual (editable — puede cambiar cada ciclo)">
-        <input type="number" step="0.01" autoFocus className={inputCls} value={rateDraft} onChange={e=>setRateDraft(e.target.value)} placeholder="Ej. 1.75"/>
-      </Field>
+
+      <div className="flex rounded-lg overflow-hidden border border-paper-300 dark:border-ink-500 self-start">
+        <button type="button" onClick={()=>setMode('pct')} className={`px-3 py-1.5 text-xs transition ${mode==='pct' ? 'bg-gold-500 text-ink-900 font-medium' : 'bg-white dark:bg-ink-700 text-gray-500'}`}>% Porcentaje</button>
+        <button type="button" onClick={()=>setMode('eur')} className={`px-3 py-1.5 text-xs transition ${mode==='eur' ? 'bg-gold-500 text-ink-900 font-medium' : 'bg-white dark:bg-ink-700 text-gray-500'}`}>€ Monto exacto</button>
+      </div>
+
+      {mode==='pct' ? (
+        <Field label="% de interés mensual (editable — puede cambiar cada ciclo)">
+          <input type="number" step="0.01" autoFocus className={inputCls} value={rateDraft} onChange={e=>setRateDraft(e.target.value)} placeholder="Ej. 1.75"/>
+        </Field>
+      ) : (
+        <Field label="Monto de interés (€) — el valor exacto que se sumará">
+          <input type="number" step="0.01" autoFocus className={inputCls} value={amountDraft} onChange={e=>setAmountDraft(e.target.value)} placeholder="Ej. 35.00"/>
+          <p className="text-[11px] text-gray-500 mt-1.5">Equivale a {balance>0.01 ? `${impliedRate}%` : '—'} sobre el saldo actual — eso queda guardado como el % para el próximo ciclo.</p>
+        </Field>
+      )}
+
       <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl p-3 text-sm flex justify-between">
         <span className="text-gray-500">Interés que se suma ahora</span>
         <span className="font-mono text-orange-500 font-medium">{fmt(interest)}</span>
@@ -1424,7 +1445,7 @@ function PayInterestNowForm({ debt, onSave, onSaveRate, onClose }) {
       <p className="text-xs text-gray-500 -mt-2">Esto sube el saldo de la tarjeta — es lo mismo que pasaría solo el día {debt.interestDay||15}, solo que lo confirmas tú ahora en vez de esperar. Si solo quieres actualizar el % para cuando se cobre solo (sin pagarlo ahora), usa "Guardar %" en vez de "Pagar interés".</p>
       <div className="flex justify-end gap-2 mt-2 flex-wrap">
         <button type="button" onClick={onClose} className="px-4 py-2 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Cancelar</button>
-        <button type="button" disabled={!rateChanged} onClick={()=>onSaveRate(rate)} className="px-4 py-2 rounded-lg border border-gold-500 text-gold-500 hover:bg-gold-500/10 font-medium transition disabled:opacity-40 disabled:cursor-not-allowed">Guardar %</button>
+        {mode==='pct' && <button type="button" disabled={!rateChanged} onClick={()=>onSaveRate(rate)} className="px-4 py-2 rounded-lg border border-gold-500 text-gold-500 hover:bg-gold-500/10 font-medium transition disabled:opacity-40 disabled:cursor-not-allowed">Guardar %</button>}
         <button type="submit" className="px-4 py-2 rounded-lg bg-gold-500 hover:bg-gold-600 text-ink-900 font-medium transition">Pagar interés</button>
       </div>
     </form>
@@ -2757,7 +2778,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     setDebts(list => list.map(x => x.id===debtId ? { ...x, interestRate: rate } : x));
   };
 
-  const payCreditCardInterestNow = (debtId, rate) => {
+  const payCreditCardInterestNow = (debtId, rate, explicitAmount) => {
     const d = debts.find(x=>x.id===debtId);
     if (!d) return;
     const newRate = rate!=null ? rate : d.interestRate;
@@ -2766,7 +2787,8 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const cyc = { pending:true, paymentDone:false, paymentAmount:0, paymentDate:null, interestDone:false, interestAmount:0, interestDate:null, ...(found ? found.cyc : {}) };
     if (cyc.interestDone) return; // ya está cobrado
     const currentBalance = creditCardBalance(d, accounts);
-    const interest = currentBalance>0.01 ? Math.round(currentBalance * ((newRate||0)/100) * 100)/100 : 0;
+    const interest = explicitAmount!=null ? Math.round(explicitAmount*100)/100
+      : (currentBalance>0.01 ? Math.round(currentBalance * ((newRate||0)/100) * 100)/100 : 0);
     const newBalance = Math.round((currentBalance + interest)*100)/100;
     cyc.interestDone = true;
     cyc.interestAmount = interest;
@@ -3606,7 +3628,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         {/* MODALES */}
         {modal?.type==='debt' && <Modal title={modal.item? 'Editar deuda':'Nueva deuda'} onClose={()=>setModal(null)}><DebtForm initial={modal.item} accounts={accounts} onSave={upsertDebt} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='creditCardPayment' && <Modal title={`Pagar ${modal.item.name}`} onClose={()=>setModal(null)}><CreditCardPaymentForm debt={modal.item} onSave={(amount, rate)=>payCreditCard(modal.item.id, amount, rate)} onClose={()=>setModal(null)}/></Modal>}
-        {modal?.type==='creditCardInterestNow' && <Modal title={`Pagar interés — ${modal.item.name}`} onClose={()=>setModal(null)}><PayInterestNowForm debt={modal.item} onSave={(rate)=>payCreditCardInterestNow(modal.item.id, rate)} onSaveRate={(rate)=>{updateCreditCardRate(modal.item.id, rate); setModal(null);}} onClose={()=>setModal(null)}/></Modal>}
+        {modal?.type==='creditCardInterestNow' && <Modal title={`Pagar interés — ${modal.item.name}`} onClose={()=>setModal(null)}><PayInterestNowForm debt={modal.item} onSave={(rate, amount)=>payCreditCardInterestNow(modal.item.id, rate, amount)} onSaveRate={(rate)=>{updateCreditCardRate(modal.item.id, rate); setModal(null);}} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='sub' && <Modal title={modal.item? 'Editar suscripción':'Nueva suscripción'} onClose={()=>setModal(null)}><SubscriptionForm initial={modal.item} accounts={accounts} onSave={upsertSub} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='fixed' && <Modal title={modal.item? 'Editar gasto fijo':'Nuevo gasto fijo'} onClose={()=>setModal(null)}><FixedForm initial={modal.item} accounts={accounts} onSave={upsertFixed} onClose={()=>setModal(null)}/></Modal>}
         {modal?.type==='project' && <Modal title={modal.item? 'Editar proyecto':'Nuevo proyecto de ahorro'} onClose={()=>setModal(null)}><SavingsProjectForm initial={modal.item} accounts={accounts} onSave={upsertProject} onClose={()=>setModal(null)}/></Modal>}
