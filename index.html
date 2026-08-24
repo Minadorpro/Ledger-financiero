@@ -3019,7 +3019,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
           const justMarked = idx===curIdx && ((d.noEndDate ? d.lastPaid : d.lastInstallmentMarkedAt) === today);
           const rawDate = new Date(y, m, clampDay(effectiveDay(d,y,m,d.paymentDay),y,m));
           out.push({ key:`debt:${d.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:d.accountId, amount:d.monthlyPayment,
-                     type:'debt', name:d.name, emoji:d.emoji, date: d.mode==='auto' ? nextBusinessDay(rawDate) : rawDate, justMarked });
+                     type:'debt', name:d.name, emoji:d.emoji, date: d.mode==='auto' ? nextBusinessDay(rawDate) : rawDate, justMarked, isCurrentCycle: idx===curIdx });
         }
       }
     });
@@ -3035,7 +3035,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
           const justMarked = idx===curIdx && s.lastPaid === today;
           const rawDate = new Date(y, m, day);
           out.push({ key:`sub:${s.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:s.accountId, amount:effectiveSubValue(s,y,m),
-                     type:'sub', name:s.name, emoji:s.emoji, date: s.mode==='auto' ? nextBusinessDay(rawDate) : rawDate, justMarked });
+                     type:'sub', name:s.name, emoji:s.emoji, date: s.mode==='auto' ? nextBusinessDay(rawDate) : rawDate, justMarked, isCurrentCycle: idx===curIdx });
         }
       }
     });
@@ -3050,7 +3050,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
           const justMarked = idx===curIdx && f.lastPaid === today;
           const rawDate = new Date(y, m, clampDay(effectiveDay(f,y,m,f.paymentDay),y,m));
           out.push({ key:`fixed:${f.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:f.accountId, amount:effectiveMonthlyValue(f,y,m),
-                     type:'fixed', name:f.name, emoji:f.emoji, date: f.mode==='auto' ? nextBusinessDay(rawDate) : rawDate, justMarked });
+                     type:'fixed', name:f.name, emoji:f.emoji, date: f.mode==='auto' ? nextBusinessDay(rawDate) : rawDate, justMarked, isCurrentCycle: idx===curIdx });
         }
       }
     });
@@ -3084,10 +3084,12 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     // pagos nuevos → se descuentan de la cuenta, pero solo si su fecha es de ayer en adelante (o si
     // se acaban de marcar pagados ahora mismo); los meses anteriores a eso quedan registrados como
     // ya aplicados sin tocar el saldo (amount 0). También reprocesamos una clave que YA estaba
-    // registrada en 0€ si se acaba de volver a marcar pagada ahora, O si su fecha (ya con el ajuste
-    // de fin de semana) cayó dentro de la ventana "de ayer en adelante" — en automático nunca se
-    // marca nada "a mano", así que sin esto último un pago automático que quedó congelado en 0€ por
-    // cualquier motivo se quedaba así para siempre, sin ninguna forma de corregirse solo.
+    // registrada en 0€ si se acaba de volver a marcar pagada ahora, si su fecha (ya con el ajuste
+    // de fin de semana) cayó dentro de la ventana "de ayer en adelante", O si es del CICLO ACTUAL
+    // (el mes que le toca ahora mismo) — esto último es clave: "de ayer en adelante" es una ventana
+    // que se mueve cada día, así que un pago automático que quedó congelado en 0€ (por el motivo que
+    // sea) y que nadie revisó justo al día siguiente se quedaba fuera de esa ventana para siempre,
+    // sin ninguna forma de corregirse solo, aunque siguiera siendo, sin duda, el pago de este ciclo.
     //
     // OJO: la re-evaluación de un congelado en 0€ solo cuenta como "nuevo" de verdad si el monto que
     // le tocaría ahora es DISTINTO de 0 — si no, cada vez que este efecto corre (que es en cada
@@ -3099,11 +3101,12 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
         const existing = appliedByKey.get(p.key);
         if (!existing) return true;
         if (existing.amount !== 0) return false;
-        if (!(p.justMarked || p.date >= cutoff)) return false;
-        const wouldBeAmount = (p.date < cutoff && !p.justMarked) ? 0 : p.amount;
+        const override = p.justMarked || p.isCurrentCycle;
+        if (!(override || p.date >= cutoff)) return false;
+        const wouldBeAmount = (p.date < cutoff && !override) ? 0 : p.amount;
         return wouldBeAmount !== 0;
       })
-      .map(p => ({ ...p, appliedAmount: (p.date < cutoff && !p.justMarked) ? 0 : p.amount }));
+      .map(p => ({ ...p, appliedAmount: (p.date < cutoff && !(p.justMarked || p.isCurrentCycle)) ? 0 : p.amount }));
     const nuevosKeys = new Set(nuevos.map(p=>p.key));
     // pagos deshechos → se devuelve a la cuenta exactamente lo que se le había descontado
     const revertidos = applied.filter(p => !dueKeys.has(p.key) && p.amount > 0 && p.accountId);
