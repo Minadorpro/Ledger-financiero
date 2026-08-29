@@ -615,6 +615,9 @@ function isPaidThisCycle(item) {
   // solo el día exacto del cobro y volviera a mostrar "sin pagar" al día siguiente.
   if (item.mode === 'auto') {
     if (item.frequency === 'annual' && item.billingDate) {
+      // las suscripciones anuales se cobran por tarjeta, no por transferencia bancaria — sí pueden
+      // procesarse en fin de semana, así que aquí NO se corre al lunes (a diferencia de deudas y
+      // gastos fijos, que sí lo necesitan).
       const today0 = new Date(); today0.setHours(0,0,0,0);
       return currentAnnualCycleStart(item.billingDate) <= today0;
     }
@@ -624,7 +627,10 @@ function isPaidThisCycle(item) {
       const occ = new Date(now.getFullYear(), now.getMonth(), clampDay(effectiveDay(item, now.getFullYear(), now.getMonth(), day), now.getFullYear(), now.getMonth()));
       occ.setHours(0,0,0,0);
       const today0 = new Date(); today0.setHours(0,0,0,0);
-      return occ <= today0;
+      // billingDay = suscripción (se cobra por tarjeta, cualquier día vale); paymentDay = tarjeta sin
+      // fecha límite (se cobra por transferencia/domiciliación, necesita día hábil).
+      const target = item.billingDay ? occ : nextBusinessDay(occ);
+      return target <= today0;
     }
   }
   if (!item.lastPaid) return false;
@@ -690,7 +696,9 @@ function isDebtPaidForOccurrence(debt, y, m) {
 function isRecurringPaidForOccurrence(item, y, m, day) {
   const occ = new Date(y, m, day); occ.setHours(0,0,0,0);
   const today0 = new Date(); today0.setHours(0,0,0,0);
-  if (item.mode === 'auto') return nextBusinessDay(occ) <= today0; // corre a lunes si cae en fin de semana
+  // las suscripciones se cobran por tarjeta (no por transferencia/domiciliación), así que sí se
+  // pueden procesar en fin de semana — a diferencia de deudas y gastos fijos, aquí no se corre a lunes.
+  if (item.mode === 'auto') return occ <= today0;
   if (!item.lastPaid) return false;
   const prevOcc = addMonths(occ, -1);
   const lastPaid = new Date(item.lastPaid);
@@ -2258,7 +2266,38 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   // nuevo — así que crear/borrar/pagar podía "no quedar guardado" a la primera (o ni a la segunda).
   const latestSnapshotRef = useRef(null);
   const saveChainRef = useRef(Promise.resolve());
+  // FRENO DE EMERGENCIA: lleva la cuenta de cuántos guardados se han pedido en los últimos segundos.
+  // Si se piden demasiados demasiado rápido (la firma de un bucle infinito, se haya originado donde
+  // se haya originado), se detiene por completo en vez de seguir golpeando Firestore sin parar — y
+  // avisa claramente en vez de fallar en silencio. Recargar la página lo reinicia.
+  const saveTimestampsRef = useRef([]);
+  const circuitBrokenRef = useRef(false);
+  // DIAGNÓSTICO: guarda el último payload enviado, para poder comparar el siguiente contra él y
+  // decir EXACTAMENTE qué campo cambió — así, si esto se vuelve a repetir, no hay que revisar a ojo
+  // un objeto con 20+ listas: la consola dice directamente cuál es la que se mueve sola.
+  const lastSavedPayloadRef = useRef(null);
   const enqueueSave = (payload) => {
+    if (circuitBrokenRef.current) return Promise.resolve();
+    if (lastSavedPayloadRef.current) {
+      const prev = lastSavedPayloadRef.current;
+      const changedKeys = Object.keys(payload).filter(k => stableStringify(payload[k]) !== stableStringify(prev[k]));
+      if (changedKeys.length) {
+        console.warn('[diagnóstico guardado] cambiaron estos campos respecto al guardado anterior:', changedKeys);
+        changedKeys.forEach(k => console.log(`  · ${k} — antes:`, prev[k], '→ ahora:', payload[k]));
+      } else {
+        console.warn('[diagnóstico guardado] este guardado es IDÉNTICO al anterior — no debería haberse disparado.');
+      }
+    }
+    lastSavedPayloadRef.current = payload;
+    const now = Date.now();
+    saveTimestampsRef.current = [...saveTimestampsRef.current.filter(t => now - t < 30000), now];
+    if (saveTimestampsRef.current.length > 6) {
+      circuitBrokenRef.current = true;
+      setSaveStatus('idle');
+      setSaveError('Guardado detenido por seguridad: se detectaron demasiados guardados seguidos en pocos segundos (posible bucle). Recarga la página. Si vuelve a pasar, avisa con lo que estabas haciendo justo antes.');
+      console.error('Freno de emergencia activado: demasiados guardados en poco tiempo.', payload);
+      return Promise.resolve();
+    }
     pendingSavesRef.current++;
     setSaveStatus('saving');
     saveChainRef.current = saveChainRef.current
@@ -2276,6 +2315,14 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     if (!loaded) return;
     const t = setTimeout(() => {
       const payload = { debts, subscriptions, fixedExpenses, savingsProjects, savingsEntries, incomeEntries, antExpenses, antBudget, savingsBudget, incomeSplitRules, financialGoals, extraIncome, salaryOverrides, expectedIncome, simulatedIncome, accounts, accountsInit, transfers, pocketPayments, appliedPayments, monthlyHistory, theme, exchangeRate };
+      // CANDADO FINAL, justo antes de tocar la red: si esto es, en contenido, exactamente igual a
+      // lo último que de verdad se guardó, no hacemos nada más — sin importar POR QUÉ se disparó
+      // este efecto. Si algo en cualquier otro lado sigue produciendo un array/objeto "nuevo" sin
+      // que el contenido cambie de verdad (la causa de los bucles de guardado que ya vimos antes),
+      // esto corta el ciclo aquí mismo, en el ÚLTIMO punto posible antes de llamar a Firestore.
+      if (lastSavedPayloadRef.current && stableStringify(payload) === stableStringify(lastSavedPayloadRef.current)) {
+        return;
+      }
       enqueueSave(payload);
     }, 150);
     return () => clearTimeout(t);
@@ -2398,6 +2445,42 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
 
     if (anyChange) {
       setDebts(updated);
+      if (accountDeltas.length) applyBalanceDeltas(accountDeltas);
+    }
+    // eslint-disable-next-line
+  }, [loaded]);
+
+  // suscripciones ANUALES en modo automático: se cobran solas cuando llega su fecha. Esto faltaba
+  // del todo — el motor genérico de duePayments solo sabe iterar MESES, así que excluye a propósito
+  // a las anuales (igual que hace con las tarjetas de crédito, que también tienen su propio motor
+  // aparte). Sin este efecto, una suscripción anual en automático se mostraba "Pagada" en cuanto
+  // pasaba su fecha (por el chequeo de isPaidThisCycle, que sí la reconoce) pero el dinero nunca
+  // llegaba a salir de la cuenta. Las suscripciones se cobran por tarjeta, no por transferencia, así
+  // que sí se procesan en fin de semana — a diferencia de deudas y gastos fijos, aquí no se corre a lunes.
+  useEffect(() => {
+    if (!loaded) return;
+    const now = new Date();
+    const accountDeltas = [];
+    let anyChange = false;
+    const updated = subscriptions.map(s => {
+      if (s.frequency!=='annual' || s.mode!=='auto' || !s.active || !s.accountId || !s.billingDate) return s;
+      const cycleStart = currentAnnualCycleStart(s.billingDate);
+      const today0 = new Date(); today0.setHours(0,0,0,0);
+      if (cycleStart > today0) return s; // todavía no le toca
+      // OJO: no usamos isPaidThisCycle aquí — en automático esa función solo mira si la fecha ya
+      // pasó, SIN importar si el dinero salió alguna vez. Usarla como candado haría que este motor
+      // se saltara el cobro para siempre en cuanto pasa la fecha, incluso si nunca llegó a cobrar de
+      // verdad (justo el problema que estamos arreglando). Miramos lastPaid directo en su lugar.
+      const lastPaid = s.lastPaid ? new Date(s.lastPaid) : null;
+      if (lastPaid && lastPaid >= cycleStart) return s; // esto sí confirma que ya se cobró de verdad
+      const amount = s.annualPrice||0;
+      if (amount>0) accountDeltas.push({ accountId: s.accountId, delta: -amount });
+      anyChange = true;
+      const key = subPeriodKey(s, now.getFullYear(), now.getMonth());
+      return { ...s, lastPaid: todayISO(), paidMonths: addPaidMonth(s.paidMonths, key) };
+    });
+    if (anyChange) {
+      setSubscriptions(updated);
       if (accountDeltas.length) applyBalanceDeltas(accountDeltas);
     }
     // eslint-disable-next-line
@@ -3035,7 +3118,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
           const justMarked = idx===curIdx && s.lastPaid === today;
           const rawDate = new Date(y, m, day);
           out.push({ key:`sub:${s.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:s.accountId, amount:effectiveSubValue(s,y,m),
-                     type:'sub', name:s.name, emoji:s.emoji, date: s.mode==='auto' ? nextBusinessDay(rawDate) : rawDate, justMarked, isCurrentCycle: idx===curIdx });
+                     type:'sub', name:s.name, emoji:s.emoji, date: rawDate, justMarked, isCurrentCycle: idx===curIdx });
         }
       }
     });
@@ -6296,11 +6379,11 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
         // de su primer cobro real. Ahora exige también que el año no sea anterior al de billingDate.
         if (y >= anchor.getFullYear() && anchor.getMonth()===m && clampDay(effectiveDay(s,y,m,anchor.getDate()),y,m)===day) {
           const paid = isRecurringPaidForOccurrence(s, y, m, day);
-          list.push({type:'sub', id:s.id, name:s.name, emoji:s.emoji, amount:effectiveSubValue(s,y,m), paid, overdue: (s.mode==='auto' ? isPastAuto : isPast) && !paid});
+          list.push({type:'sub', id:s.id, name:s.name, emoji:s.emoji, amount:effectiveSubValue(s,y,m), paid, overdue: isPast && !paid});
         }
       } else if (startedByMonth(s.startDate, y, m) && clampDay(effectiveDay(s,y,m,s.billingDay),y,m)===day) {
         const paid = isRecurringPaidForOccurrence(s, y, m, day);
-        list.push({type:'sub', id:s.id, name:s.name, emoji:s.emoji, amount:effectiveSubValue(s,y,m), paid, overdue: (s.mode==='auto' ? isPastAuto : isPast) && !paid});
+        list.push({type:'sub', id:s.id, name:s.name, emoji:s.emoji, amount:effectiveSubValue(s,y,m), paid, overdue: isPast && !paid});
       }
     });
     fixed.forEach(f => {
