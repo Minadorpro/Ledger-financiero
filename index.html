@@ -2636,6 +2636,14 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   const deleteItem = () => {
     if (!confirmDel) return;
     const { type, id } = confirmDel;
+    // al borrar una deuda/suscripción/gasto fijo, hay que borrar TAMBIÉN sus pagos ya aplicados
+    // (appliedPayments) — si no, el motor que compara "lo que debería estar pendiente" contra "lo
+    // que ya se aplicó" ve que esas claves desaparecieron de golpe y las interpreta como pagos que
+    // "se deshicieron", devolviendo a la cuenta dinero que en realidad ya se gastó de verdad hace
+    // tiempo. Borrar el REGISTRO de la deuda no debe resucitar dinero que ya salió.
+    if (type==='debt' || type==='sub' || type==='fixed') {
+      setAppliedPayments(l => l ? l.filter(p => !p.key.startsWith(`${type}:${id}:`)) : l);
+    }
     if (type==='debt') setDebts(l=>l.filter(x=>x.id!==id));
     if (type==='sub') setSubscriptions(l=>l.filter(x=>x.id!==id));
     if (type==='fixed') setFixedExpenses(l=>l.filter(x=>x.id!==id));
