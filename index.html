@@ -633,6 +633,11 @@ function isPaidThisCycle(item) {
       return target <= today0;
     }
   }
+  // deudas "sin fecha límite" manuales: cada mes se recuerda por separado en paidCycles, en vez de
+  // fiarnos solo del último lastPaid (que solo puede representar UN mes a la vez — si te atrasas un
+  // mes y luego pagas, lastPaid saltaba directo al mes en que pagaste y el mes atrasado se quedaba
+  // marcado como "atrasado" para siempre, sin ninguna forma de ponerse al día).
+  if (item.paidCycles) return item.paidCycles.includes(currentMonthKey());
   if (!item.lastPaid) return false;
   const lastPaid = new Date(item.lastPaid); lastPaid.setHours(0,0,0,0);
   if (item.frequency==='annual' && item.billingDate) return lastPaid >= currentAnnualCycleStart(item.billingDate);
@@ -684,6 +689,11 @@ function isDebtPaidForOccurrence(debt, y, m) {
   const today0 = new Date(); today0.setHours(0,0,0,0);
   if (debt.mode === 'auto') return nextBusinessDay(occ) <= today0; // "automático": corre a lunes si cae en fin de semana
   if (debt.noEndDate) {
+    const key = `${y}-${String(m+1).padStart(2,'0')}`;
+    // paidCycles recuerda CADA mes marcado como pagado por separado. Las deudas creadas antes de
+    // este cambio no tienen el campo aún, así que para ellas usamos el comportamiento antiguo
+    // (solo el último lastPaid cuenta) — en cuanto se vuelva a marcar un pago, ya queda migrada.
+    if (debt.paidCycles) return debt.paidCycles.includes(key);
     if (!debt.lastPaid) return false;
     // ¿el último pago cayó en ESTE mismo mes calendario? (antes esto usaba un rango de casi 2 meses
     // que hacía que un pago de fin de julio contara también como "pagado" para agosto)
@@ -691,6 +701,22 @@ function isDebtPaidForOccurrence(debt, y, m) {
   }
   const idx = installmentIndexAt(debt, y, m);
   return idx > 0 && idx <= effectivePaid(debt);
+}
+// para deudas "sin fecha límite" manuales: ¿queda algún mes (desde que empezó hasta el actual) sin
+// marcar como pagado? A diferencia de isPaidThisCycle (que solo mira el mes en curso), esto SÍ mira
+// hacia atrás — para que, si el mes actual ya está pagado pero quedó un mes atrasado sin resolver
+// (ej. te olvidaste de agosto y pagaste septiembre), el botón de "Marcar como pagado" no desaparezca
+// y te deje ese mes colgado para siempre sin ninguna forma de ponerte al día.
+function oldestUnpaidCycle(debt) {
+  const now = new Date();
+  const curIdx = now.getFullYear()*12 + now.getMonth();
+  const first = new Date(debt.firstPaymentDate);
+  const firstIdx = Math.max(first.getFullYear()*12 + first.getMonth(), 0);
+  for (let idx = firstIdx; idx <= curIdx; idx++) {
+    const y = Math.floor(idx/12), m = idx%12;
+    if (!isDebtPaidForOccurrence(debt, y, m)) return { y, m, isCurrent: idx===curIdx };
+  }
+  return null;
 }
 // ¿está pagada la ocurrencia de una suscripción/gasto fijo en el mes (y,m)?
 function isRecurringPaidForOccurrence(item, y, m, day) {
@@ -2789,7 +2815,55 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       applyBalanceDeltas([{ accountId: f.accountId, delta: amount }]);
     }
   };
-  const markDebtCyclePaid = (id) => setDebts(l => l.map(d => d.id===id ? {...d, lastPaid: todayISO()} : d));
+  // a diferencia de markDebtCyclePaid (que SIEMPRE agarra el mes más antiguo sin pagar), esta función
+  // deja elegir el mes EXACTO a mano desde el Calendario — necesaria para casos como "hice un pago
+  // pensando en agosto, no en el mes de hoy (septiembre)", donde adivinar el mes por fecha real no
+  // sirve. Migra paidCycles igual que markDebtCyclePaid la primera vez que se usa.
+  const toggleDebtCycle = (id, y, m) => setDebts(list => list.map(d => {
+    if (d.id !== id || !d.noEndDate) return d;
+    const key = `${y}-${String(m+1).padStart(2,'0')}`;
+    const prevCycles = d.paidCycles || (d.lastPaid ? [`${new Date(d.lastPaid).getFullYear()}-${String(new Date(d.lastPaid).getMonth()+1).padStart(2,'0')}`] : []);
+    const has = prevCycles.includes(key);
+    const paidCycles = has ? prevCycles.filter(k=>k!==key) : [...prevCycles, key];
+    // si se está DESmarcando el mes que justo se había marcado como "recién pagado", limpiamos esa
+    // marca para que no quede una referencia colgando a un mes que ya no cuenta como pagado.
+    const clearingJustMarked = has && d.lastMarkedCycleKey === key;
+    return {
+      ...d, paidCycles,
+      ...(has ? {} : { lastPaid: todayISO(), lastMarkedCycleKey: key }),
+      ...(clearingJustMarked ? { lastMarkedCycleKey: null } : {}),
+    };
+  }));
+
+  const markDebtCyclePaid = (id) => setDebts(list => list.map(d => {
+    if (d.id !== id) return d;
+    const now = new Date();
+    const curIdx = now.getFullYear()*12 + now.getMonth();
+    const first = new Date(d.firstPaymentDate);
+    const firstIdx = first.getFullYear()*12 + first.getMonth();
+    const startIdx = Math.max(firstIdx, 0);
+    // paidCycles ya podría venir vacío (deuda nueva) o migrando desde el lastPaid antiguo (un solo
+    // mes) — en ambos casos, isDebtPaidForOccurrence ya sabe interpretarlo, así que reutilizamos esa
+    // misma función para encontrar el primer mes, de más antiguo a más reciente, que aún no esté pagado.
+    let targetIdx = curIdx;
+    for (let idx = startIdx; idx <= curIdx; idx++) {
+      const y = Math.floor(idx/12), m = idx%12;
+      if (!isDebtPaidForOccurrence(d, y, m)) { targetIdx = idx; break; }
+    }
+    const ty = Math.floor(targetIdx/12), tm = targetIdx%12;
+    const key = `${ty}-${String(tm+1).padStart(2,'0')}`;
+    const prevCycles = d.paidCycles || (d.lastPaid ? [`${new Date(d.lastPaid).getFullYear()}-${String(new Date(d.lastPaid).getMonth()+1).padStart(2,'0')}`] : []);
+    const paidCycles = prevCycles.includes(key) ? prevCycles : [...prevCycles, key];
+    return { ...d, paidCycles, lastPaid: todayISO(), lastMarkedCycleKey: key };
+  }));
+  // deshacer: solo tiene sentido si lo que se acaba de marcar fue HOY (mismo criterio que el resto
+  // de la app) — quita ese mes concreto de paidCycles, sin tocar los meses anteriores que ya estaban
+  // resueltos de antes.
+  const undoDebtCyclePaid = (id) => setDebts(list => list.map(d => {
+    if (d.id !== id || d.lastPaid !== todayISO() || !d.lastMarkedCycleKey) return d;
+    const key = d.lastMarkedCycleKey;
+    return { ...d, paidCycles: (d.paidCycles||[]).filter(k=>k!==key), lastMarkedCycleKey: null, lastPaid: null };
+  }));
 
   // pago de tarjeta de crédito (manual, desde el botón "Pagar tarjeta"): el monto pagado se resta
   // del saldo YA. Si quedó algo pendiente, el interés se agenda para cobrarse solo el día que
@@ -3104,10 +3178,15 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
       for (let idx = firstIdx; idx <= endIdx; idx++) {
         const y = Math.floor(idx/12), m = idx%12;
         if (isDebtPaidForOccurrence(d, y, m)) {
-          // "recién marcado hoy": para deudas con cuotas mira lastInstallmentMarkedAt, para las de
-          // saldo (sin fecha límite) mira lastPaid — es la señal de que ESTA acción se hizo ahora
-          // mismo, así que debe mover dinero ya, aunque la fecha de cobro del calendario ya haya pasado.
-          const justMarked = idx===curIdx && ((d.noEndDate ? d.lastPaid : d.lastInstallmentMarkedAt) === today);
+          // "recién marcado hoy": para deudas con cuotas mira lastInstallmentMarkedAt (solo aplica al
+          // mes actual). Para las de saldo (sin fecha límite) comparamos contra lastMarkedCycleKey,
+          // que guarda el mes EXACTO que se acaba de marcar — puede ser un mes atrasado (ej. agosto,
+          // marcado hoy en septiembre), no solo el mes en curso, para que ese pago sí mueva dinero
+          // aunque su fecha de cobro ya haya quedado atrás.
+          const monthKey = `${y}-${String(m+1).padStart(2,'0')}`;
+          const justMarked = d.noEndDate
+            ? (d.lastMarkedCycleKey === monthKey && d.lastPaid === today)
+            : (idx===curIdx && d.lastInstallmentMarkedAt === today);
           const rawDate = new Date(y, m, clampDay(effectiveDay(d,y,m,d.paymentDay),y,m));
           out.push({ key:`debt:${d.id}:${y}-${String(m+1).padStart(2,'0')}`, accountId:d.accountId, amount:d.monthlyPayment,
                      type:'debt', name:d.name, emoji:d.emoji, date: d.mode==='auto' ? nextBusinessDay(rawDate) : rawDate, justMarked, isCurrentCycle: idx===curIdx });
@@ -3607,7 +3686,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
               })()}
               {view==='debts' && (
                 <DebtsView debts={debts} accounts={accounts} onAdd={()=>setModal({type:'debt'})} onEdit={(d)=>setModal({type:'debt', item:d})}
-                  onDelete={(d)=>setConfirmDel({type:'debt', id:d.id, name:d.name})} onPay={payInstallment} onUndo={undoInstallment} onFinish={finishDebt} onMarkCyclePaid={markDebtCyclePaid}
+                  onDelete={(d)=>setConfirmDel({type:'debt', id:d.id, name:d.name})} onPay={payInstallment} onUndo={undoInstallment} onFinish={finishDebt} onMarkCyclePaid={markDebtCyclePaid} onUndoCyclePaid={undoDebtCyclePaid}
                   onPayCreditCard={(d)=>setModal({type:'creditCardPayment', item:d})}
                   onPayCreditCardInterestNow={(d)=>setModal({type:'creditCardInterestNow', item:d})} onUndoCreditCardPayment={undoCreditCardPayment} onUndoCreditCardInterest={undoCreditCardInterest}
                   onUndoCreditCardManualPayment={undoCreditCardManualPayment}
@@ -3671,7 +3750,7 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
               )}
               {view==='calendar' && (
                 <CalendarView debts={activeDebts} subs={activeSubs} fixed={fixedExpenses}
-                  calMonth={calMonth} setCalMonth={setCalMonth} selectedDay={calSelectedDay} setSelectedDay={setCalSelectedDay} onMoveOccurrence={onMoveOccurrence}/>
+                  calMonth={calMonth} setCalMonth={setCalMonth} selectedDay={calSelectedDay} setSelectedDay={setCalSelectedDay} onMoveOccurrence={onMoveOccurrence} onToggleDebtCycle={toggleDebtCycle}/>
               )}
               {view==='stats' && (
                 <StatsView distribution={distribution} projection={projection} totalCommitted={totalCommitted}
@@ -3933,7 +4012,7 @@ function Dashboard({ totalCommitted, pendingThisMonth, totalDebtMonthly, totalDe
 /* =========================================================================
    DEUDAS
    ========================================================================= */
-function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, onFinish, onMarkCyclePaid, onPayCreditCard, onPayCreditCardInterestNow, onUndoCreditCardPayment, onUndoCreditCardInterest, onUndoCreditCardManualPayment, totalMonthly, activeCount, notStarted, pending }) {
+function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, onFinish, onMarkCyclePaid, onUndoCyclePaid, onPayCreditCard, onPayCreditCardInterestNow, onUndoCreditCardPayment, onUndoCreditCardInterest, onUndoCreditCardManualPayment, totalMonthly, activeCount, notStarted, pending }) {
   const [q, setQ] = useState('');
   const [filter, setFilter] = useState('activas');
   const filtered = debts.filter(d => {
@@ -3980,9 +4059,13 @@ function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, on
                 const idx = installmentIndexAt(d, nowD.getFullYear(), nowD.getMonth());
                 return idx > 0 && idx <= effectivePaid(d);
               })());
-          const overdueDebt = !d.finished && d.mode!=='auto' && !monthPaid
-            && debtStarted(d)
-            && nowD.getDate() > clampDay(effectiveDay(d, nowD.getFullYear(), nowD.getMonth(), d.paymentDay), nowD.getFullYear(), nowD.getMonth());
+          // para deudas sin fecha límite, un mes ATRASADO de antes (no el actual) ya es overdue de por
+          // sí, sin tener que esperar a que pase de nuevo el día de pago de este mes.
+          const pendingCycleGap = d.noEndDate && !d.finished && d.mode!=='auto' ? oldestUnpaidCycle(d) : null;
+          const overdueDebt = !d.finished && d.mode!=='auto'
+            && (d.noEndDate
+              ? (pendingCycleGap && !pendingCycleGap.isCurrent)
+              : (!monthPaid && debtStarted(d) && nowD.getDate() > clampDay(effectiveDay(d, nowD.getFullYear(), nowD.getMonth(), d.paymentDay), nowD.getFullYear(), nowD.getMonth())));
           // "Pagado" solo se muestra el día exacto en que se marcó/pagó (auto: el mismo día del cargo;
           // manual: el día que se hizo clic en "marcar"). El resto de días muestra el conteo normal.
           const paidToday = d.mode==='auto'
@@ -4033,7 +4116,7 @@ function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, on
 
               {overdueDebt && (
                 <div className="flex items-center gap-1.5 text-orange-500 text-xs bg-orange-500/10 rounded-lg px-2 py-1.5">
-                  <IBell size={13}/> Atrasado: no marcaste la cuota de {MESES[new Date().getMonth()].toLowerCase()}
+                  <IBell size={13}/> Atrasado: no marcaste el pago de {MESES[d.noEndDate && pendingCycleGap ? pendingCycleGap.m : new Date().getMonth()].toLowerCase()}
                 </div>
               )}
 
@@ -4072,6 +4155,13 @@ function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, on
                     );
                   })()}
 
+                  {pendingCycleGap && !pendingCycleGap.isCurrent && (
+                    <div className="flex items-center justify-between gap-2 bg-orange-500/10 rounded-lg px-2 py-1.5">
+                      <span className="text-orange-500 text-xs">No mueve saldo, solo corrige el calendario</span>
+                      <button onClick={()=>onMarkCyclePaid(d.id)} className="text-xs text-gold-500 hover:underline shrink-0">Poner {MESES[pendingCycleGap.m].toLowerCase()} al día</button>
+                    </div>
+                  )}
+
                   {(() => {
                     // el interés pendiente puede vivir en un ciclo de un mes distinto al actual
                     // (si pagaste ahora pero el día de interés cae más adelante)
@@ -4104,11 +4194,14 @@ function DebtsView({ debts, accounts, onAdd, onEdit, onDelete, onPay, onUndo, on
                 <div className="flex flex-col gap-2 mt-1">
                   {d.mode==='auto' ? (
                     <div className="text-xs text-gray-500 flex items-center gap-1.5"><IBolt size={13} className="text-gold-500"/> Se actualiza sola según la fecha de pago.</div>
-                  ) : isPaidThisCycle(d) ? (
-                    <div className="flex items-center gap-1.5 text-emerald-400 text-xs"><ICheck size={13}/> Pagado este ciclo</div>
+                  ) : !pendingCycleGap ? (
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="flex items-center gap-1.5 text-emerald-400 text-xs"><ICheck size={13}/> Pagado este ciclo</span>
+                      {d.lastPaid===todayISO() && <button onClick={()=>onUndoCyclePaid(d.id)} className="px-3 py-1.5 rounded-lg text-xs text-gray-500 dark:text-gray-400 hover:bg-paper-200 dark:hover:bg-ink-600 transition">Deshacer</button>}
+                    </div>
                   ) : (
                     <button onClick={()=>onMarkCyclePaid(d.id)} className="flex items-center justify-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition">
-                      <ICheck size={13}/> Marcar como pagado
+                      <ICheck size={13}/> {pendingCycleGap.isCurrent ? 'Marcar como pagado' : `Marcar ${MESES[pendingCycleGap.m].toLowerCase()} como pagado (atrasado)`}
                     </button>
                   )}
                   <button onClick={()=>onFinish(d.id)} className="flex items-center justify-center gap-1.5 text-gray-500 hover:text-gold-500 text-xs border border-paper-300 dark:border-ink-500 py-2 rounded-lg transition">
@@ -6353,7 +6446,7 @@ function SplitView({ rules, accounts, incomeAuto, salaryOverride, salaryForSplit
 /* =========================================================================
    CALENDARIO
    ========================================================================= */
-function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, setSelectedDay, onMoveOccurrence }) {
+function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, setSelectedDay, onMoveOccurrence, onToggleDebtCycle }) {
   const { y, m } = calMonth;
   const totalDays = daysInMonth(y,m);
   const firstWeekday = (new Date(y,m,1).getDay()+6)%7; // lunes=0
@@ -6376,7 +6469,7 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
       const withinSchedule = d.noEndDate || !d.totalInstallments || (monthIndex - firstIndex) < d.totalInstallments;
       if (monthIndex >= firstIndex && withinSchedule && clampDay(effectiveDay(d,y,m,d.paymentDay),y,m)===day) {
         const paid = isDebtPaidForOccurrence(d, y, m);
-        list.push({type:'debt', id:d.id, name:d.name, emoji:d.emoji, amount:d.monthlyPayment, paid, overdue: (d.mode==='auto' ? isPastAuto : isPast) && !paid});
+        list.push({type:'debt', id:d.id, name:d.name, emoji:d.emoji, amount:d.monthlyPayment, paid, overdue: (d.mode==='auto' ? isPastAuto : isPast) && !paid, noEndDate: d.noEndDate, debtMode: d.mode});
       }
     });
     subs.forEach(s => {
@@ -6484,7 +6577,7 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
       {selectedDay && (
         <div className="bg-white dark:bg-ink-700 border border-paper-300 dark:border-ink-500/70 rounded-2xl p-5 shadow-soft animate-fadein">
           <div className="font-medium text-ink-900 dark:text-gray-100 mb-3">Pagos el día {selectedDay}</div>
-          <p className="text-xs text-gray-500 -mt-2 mb-3">Arrastra una suscripción o gasto fijo a otro día de este mismo mes para corregir cuándo se pagó de verdad. Las deudas no se pueden arrastrar.</p>
+          <p className="text-xs text-gray-500 -mt-2 mb-3">Arrastra una suscripción o gasto fijo a otro día de este mismo mes para corregir cuándo se pagó de verdad. Las deudas no se pueden arrastrar, pero las de "sin fecha límite" (tarjetas incluidas) tienen su propio botón para marcar/desmarcar este mes concreto.</p>
           {dayList.length ? dayList.map((it,i)=>(
             <div key={i} draggable={it.type!=='debt'} onDragStart={(e)=> it.type!=='debt' && handleDragStart(e, it)}
               className={`flex items-center gap-3 py-2 border-paper-300/80 dark:border-ink-500/40 first:border-t-0 text-sm rounded-lg px-1 -mx-1 transition ${it.type!=='debt' ? 'cursor-grab active:cursor-grabbing hover:bg-paper-200/60 dark:hover:bg-ink-600/40' : ''}`}>
@@ -6497,6 +6590,11 @@ function CalendarView({ debts, subs, fixed, calMonth, setCalMonth, selectedDay, 
                 {it.type==='debt'?'Deuda':it.type==='sub'?'Suscripción':'Fijo'}
               </span>
               <span className={`font-mono text-gray-700 dark:text-gray-300 ${it.paid ? 'line-through opacity-60' : ''}`}>{fmt(it.amount)}</span>
+              {it.type==='debt' && it.noEndDate && it.debtMode!=='auto' && (
+                <button onClick={()=>onToggleDebtCycle(it.id, y, m)} className="text-xs text-gold-500 hover:underline shrink-0">
+                  {it.paid ? 'Desmarcar' : 'Marcar pagado'}
+                </button>
+              )}
             </div>
           )) : <div className="text-gray-500 dark:text-gray-500">Sin pagos este día.</div>}
         </div>
