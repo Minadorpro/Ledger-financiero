@@ -2786,19 +2786,23 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   // igual que toggleFixedMonth: los gastos fijos sin día fijo quedan fuera del motor automático,
   // así que "Marcar como pagado" descuenta el saldo directamente aquí (solo si es la primera vez
   // que se marca este mes, para no descontar dos veces si se hace clic más de una vez).
-  const markFixedPaid = (id, amount) => {
+  const markFixedPaid = (id, amount, accountId) => {
     const f = fixedExpenses.find(x=>x.id===id);
     if (!f) return;
     const now = new Date();
     const key = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
     const alreadyPaid = (f.paidMonths||[]).includes(key);
     const finalAmount = f.manualMonthlyValue ? (Number(amount) || 0) : (f.monthlyValue||0);
+    // si no se elige cuenta explícitamente (ej. gastos de monto fijo, que no tienen este selector),
+    // se sigue usando la cuenta por defecto del gasto fijo, tal como antes.
+    const payAccountId = accountId || f.accountId;
     setFixedExpenses(l => l.map(x => x.id===id
       ? {...x, lastPaid: todayISO(), paidMonths: addPaidMonth(x.paidMonths),
+         paidAccounts: {...(x.paidAccounts||{}), [key]: payAccountId},
          ...(f.manualMonthlyValue ? { monthlyValues: {...(x.monthlyValues||{}), [key]: finalAmount} } : {})}
       : x));
-    if (!alreadyPaid && f.accountId && !f.paymentDay) {
-      applyBalanceDeltas([{ accountId: f.accountId, delta: -finalAmount }]);
+    if (!alreadyPaid && payAccountId && !f.paymentDay) {
+      applyBalanceDeltas([{ accountId: payAccountId, delta: -finalAmount }]);
     }
   };
   // deshacer: igual que undoSubPaid para el mes/lastPaid. Si el gasto fijo NO tiene día fijo, el motor
@@ -2810,9 +2814,10 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
     const key = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
     const wasPaid = (f.paidMonths||[]).includes(key);
     const amount = effectiveMonthlyValue(f, now.getFullYear(), now.getMonth());
+    const refundAccountId = (f.paidAccounts||{})[key] || f.accountId;
     setFixedExpenses(l => l.map(x => x.id===id ? {...x, lastPaid: null, paidMonths: (x.paidMonths||[]).filter(k=>k!==key)} : x));
-    if (wasPaid && f.accountId && !f.paymentDay) {
-      applyBalanceDeltas([{ accountId: f.accountId, delta: amount }]);
+    if (wasPaid && refundAccountId && !f.paymentDay) {
+      applyBalanceDeltas([{ accountId: refundAccountId, delta: amount }]);
     }
   };
   // a diferencia de markDebtCyclePaid (que SIEMPRE agarra el mes más antiguo sin pagar), esta función
@@ -4395,9 +4400,10 @@ function FixedCard({ f, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggle
 
   const [editingAmount, setEditingAmount] = useState(false);
   const [amountDraft, setAmountDraft] = useState(displayAmount || '');
+  const [payAccountDraft, setPayAccountDraft] = useState(f.accountId || null);
 
   const confirmPaid = () => {
-    onMarkPaid(f.id, Number(amountDraft) || 0);
+    onMarkPaid(f.id, Number(amountDraft) || 0, payAccountDraft);
     setEditingAmount(false);
   };
 
@@ -4436,13 +4442,18 @@ function FixedCard({ f, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggle
           </div>
         ) : f.manualMonthlyValue ? (
           editingAmount ? (
-            <div className="flex items-center gap-2">
-              <input type="number" step="0.01" autoFocus className={inputCls+" max-w-[130px]"} value={amountDraft} onChange={e=>setAmountDraft(e.target.value)} onKeyDown={e=>e.key==='Enter' && confirmPaid()}/>
-              <button onClick={confirmPaid} className="flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition"><ICheck size={13}/> Confirmar</button>
-              <button onClick={()=>setEditingAmount(false)} className="px-3 py-1.5 rounded-lg text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600 text-xs transition">Cancelar</button>
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <input type="number" step="0.01" autoFocus className={inputCls+" max-w-[130px]"} value={amountDraft} onChange={e=>setAmountDraft(e.target.value)} onKeyDown={e=>e.key==='Enter' && confirmPaid()}/>
+                <button onClick={confirmPaid} className="flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition"><ICheck size={13}/> Confirmar</button>
+                <button onClick={()=>setEditingAmount(false)} className="px-3 py-1.5 rounded-lg text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600 text-xs transition">Cancelar</button>
+              </div>
+              <div className="max-w-[240px]">
+                <AccountField accounts={accounts} value={payAccountDraft} onChange={setPayAccountDraft}/>
+              </div>
             </div>
           ) : (
-            <button onClick={()=>{setAmountDraft(displayAmount||''); setEditingAmount(true);}} className="self-start flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition">
+            <button onClick={()=>{setAmountDraft(displayAmount||''); setPayAccountDraft(f.accountId||null); setEditingAmount(true);}} className="self-start flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition">
               <ICheck size={13}/> Marcar como pagado
             </button>
           )
