@@ -2786,18 +2786,21 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   // igual que toggleFixedMonth: los gastos fijos sin día fijo quedan fuera del motor automático,
   // así que "Marcar como pagado" descuenta el saldo directamente aquí (solo si es la primera vez
   // que se marca este mes, para no descontar dos veces si se hace clic más de una vez).
-  const markFixedPaid = (id, amount, accountId) => {
+  const markFixedPaid = (id, amount, accountId, paymentDate) => {
     const f = fixedExpenses.find(x=>x.id===id);
     if (!f) return;
-    const now = new Date();
-    const key = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+    // la fecha elegida solo tiene sentido para gastos SIN día fijo (los que se descuentan aquí mismo,
+    // más abajo). Los que sí tienen día fijo los mueve el motor automático (duePayments), que espera
+    // que lastPaid sea "hoy" para reconocer un pago recién marcado — así que para esos seguimos
+    // usando todayISO() tal cual antes.
+    const dateISO = (!f.paymentDay && paymentDate) ? paymentDate : todayISO();
+    const d = new Date(dateISO);
+    const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
     const alreadyPaid = (f.paidMonths||[]).includes(key);
     const finalAmount = f.manualMonthlyValue ? (Number(amount) || 0) : (f.monthlyValue||0);
-    // si no se elige cuenta explícitamente (ej. gastos de monto fijo, que no tienen este selector),
-    // se sigue usando la cuenta por defecto del gasto fijo, tal como antes.
     const payAccountId = accountId || f.accountId;
     setFixedExpenses(l => l.map(x => x.id===id
-      ? {...x, lastPaid: todayISO(), paidMonths: addPaidMonth(x.paidMonths),
+      ? {...x, lastPaid: dateISO, paidMonths: addPaidMonth(x.paidMonths, key),
          paidAccounts: {...(x.paidAccounts||{}), [key]: payAccountId},
          ...(f.manualMonthlyValue ? { monthlyValues: {...(x.monthlyValues||{}), [key]: finalAmount} } : {})}
       : x));
@@ -2809,11 +2812,11 @@ function App({ userId, userEmail, isAdmin, onLogout }) {
   // automático nunca lo tocó, así que aquí devolvemos el dinero directamente (espejo de markFixedPaid).
   const undoFixedPaid = (id) => {
     const f = fixedExpenses.find(x=>x.id===id);
-    if (!f) return;
-    const now = new Date();
-    const key = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+    if (!f || !f.lastPaid) return;
+    const d = new Date(f.lastPaid);
+    const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
     const wasPaid = (f.paidMonths||[]).includes(key);
-    const amount = effectiveMonthlyValue(f, now.getFullYear(), now.getMonth());
+    const amount = effectiveMonthlyValue(f, d.getFullYear(), d.getMonth());
     const refundAccountId = (f.paidAccounts||{})[key] || f.accountId;
     setFixedExpenses(l => l.map(x => x.id===id ? {...x, lastPaid: null, paidMonths: (x.paidMonths||[]).filter(k=>k!==key)} : x));
     if (wasPaid && refundAccountId && !f.paymentDay) {
@@ -4395,15 +4398,16 @@ function FixedCard({ f, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggle
   const overdue = !!f.paymentDay && f.mode!=='auto' && !paid
     && startedByMonth(f.startDate, now.getFullYear(), now.getMonth())
     && now.getDate() > clampDay(effectiveDay(f, now.getFullYear(), now.getMonth(), f.paymentDay), now.getFullYear(), now.getMonth());
-  const paidToday = f.mode==='auto' ? (daysUntil===0 && paid) : (f.lastPaid===todayISO());
+  const paidToday = f.mode==='auto' ? (daysUntil===0 && paid) : (f.paymentDay ? (f.lastPaid===todayISO()) : paid);
   const displayAmount = effectiveMonthlyValueNow(f);
 
   const [editingAmount, setEditingAmount] = useState(false);
   const [amountDraft, setAmountDraft] = useState(displayAmount || '');
   const [payAccountDraft, setPayAccountDraft] = useState(f.accountId || null);
+  const [payDateDraft, setPayDateDraft] = useState(todayISO());
 
   const confirmPaid = () => {
-    onMarkPaid(f.id, Number(amountDraft) || 0, payAccountDraft);
+    onMarkPaid(f.id, Number(amountDraft) || 0, payAccountDraft, payDateDraft);
     setEditingAmount(false);
   };
 
@@ -4445,6 +4449,7 @@ function FixedCard({ f, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggle
             <div className="flex flex-col gap-2">
               <div className="flex items-center gap-2">
                 <input type="number" step="0.01" autoFocus className={inputCls+" max-w-[130px]"} value={amountDraft} onChange={e=>setAmountDraft(e.target.value)} onKeyDown={e=>e.key==='Enter' && confirmPaid()}/>
+                {!f.paymentDay && <input type="date" className={inputCls+" max-w-[160px]"} value={payDateDraft} onChange={e=>setPayDateDraft(e.target.value)} max={todayISO()}/>}
                 <button onClick={confirmPaid} className="flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition"><ICheck size={13}/> Confirmar</button>
                 <button onClick={()=>setEditingAmount(false)} className="px-3 py-1.5 rounded-lg text-gray-500 hover:bg-paper-200 dark:hover:bg-ink-600 text-xs transition">Cancelar</button>
               </div>
@@ -4453,7 +4458,7 @@ function FixedCard({ f, accounts, onEdit, onDelete, onMarkPaid, onUndo, onToggle
               </div>
             </div>
           ) : (
-            <button onClick={()=>{setAmountDraft(displayAmount||''); setPayAccountDraft(f.accountId||null); setEditingAmount(true);}} className="self-start flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition">
+            <button onClick={()=>{setAmountDraft(displayAmount||''); setPayAccountDraft(f.accountId||null); setPayDateDraft(todayISO()); setEditingAmount(true);}} className="self-start flex items-center gap-1.5 bg-gold-500 hover:bg-gold-600 text-ink-900 text-xs font-medium px-3 py-1.5 rounded-lg transition">
               <ICheck size={13}/> Marcar como pagado
             </button>
           )
